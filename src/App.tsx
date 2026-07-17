@@ -3,7 +3,7 @@ import { Toaster, toast as sonnerToast } from 'sonner';
 import { Users, UserCheck, BookOpen, Calendar as CalendarIcon, DollarSign, FileText, Settings, LogOut, LayoutDashboard, Activity, ChartBar as BarChart3, Plus, Search, ListFilter as Filter, Download, Printer, Share2, Pencil as Edit2, UserCog, Trash2, CircleCheck as CheckCircle2, Circle as XCircle, ChevronDown, Menu, X, SquareCheck as CheckSquare, Briefcase, Bell, CircleAlert as AlertCircle, Eye, RefreshCw, Trash, ArchiveRestore, ArrowLeft, KeyRound, ShieldCheck, Shield, MessageSquare, GraduationCap, Clock, Hash, User, Award, QrCode, Quote, Cloud, CloudOff, Sun, CloudRain, CloudLightning, Droplets, Wind, Thermometer, Link as LinkIcon, MessageCircle, Check, Trophy, Target, Zap, Star, Medal, Mic, Terminal, Copy, Inbox, Database } from 'lucide-react';
 
 // Link Eksekusi Google App Script Anda
-const APPSCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzxc934v5BS_sGzVdX4EFz6s6-nikydP_BsQmZtc5OkF2DM40SxI-yP-ZwIyxbmVtC2_Q/exec';
+const APPSCRIPT_URL = 'https://script.google.com/macros/s/AKfycbx5DB8FtAaTV23WggnHjyFFRlY7Dgn3W7MpBZkT4fC5-64J4nF8M6fKXkqfuSV6sdL-/exec';
 
 declare global {
   interface Window {
@@ -1153,12 +1153,12 @@ const StudentDashboard = ({ db, user, setActiveTab, today, isCloudConnected, lan
         </div>
 
         {/* QUICK STATS CARDS */}
-        <div className="flex flex-wrap justify-center gap-3 sm:gap-4">
-           <div className="w-[calc(50%-0.375rem)] sm:w-[calc(33.333%-0.667rem)] lg:w-[calc(20%-0.8rem)]"><KPICard title={language === 'id' ? 'Kehadiran' : 'Attendance'} value={`${attRateThisMonth}%`} subtext={`${presentThisMonth} ${language === 'id' ? 'sesi dihadiri' : 'sessions attended'}`} icon={UserCheck} colorClass={attRateThisMonth >= 80 ? "bg-emerald-500" : "bg-amber-500"} onClick={() => setActiveTab('my_attendance')} /></div>
-           <div className="w-[calc(50%-0.375rem)] sm:w-[calc(33.333%-0.667rem)] lg:w-[calc(20%-0.8rem)]"><KPICard title={language === 'id' ? 'Tugas' : 'Assignments'} value={pendingAss} subtext={pendingAss > 0 ? (language === 'id' ? "Batas waktu bulan ini" : "Due this month") : (language === 'id' ? "Semua selesai!" : "All caught up!")} icon={CheckSquare} colorClass={pendingAss === 0 ? "bg-emerald-500" : "bg-rose-500"} onClick={() => setActiveTab('my_assessments')} /></div>
-           <div className="w-[calc(50%-0.375rem)] sm:w-[calc(33.333%-0.667rem)] lg:w-[calc(20%-0.8rem)]"><KPICard title={language === 'id' ? 'Jurnal Belajar' : 'Learning Journal'} value={journalEntriesThisMonth} subtext={language === 'id' ? 'Total entri' : "Total entries"} icon={BookOpen} colorClass="bg-purple-500" onClick={() => setActiveTab('my_journals')} /></div>
-           <div className="w-[calc(50%-0.375rem)] sm:w-[calc(33.333%-0.667rem)] lg:w-[calc(20%-0.8rem)]"><KPICard title={language === 'id' ? 'Nilai Akademik' : 'Academic Score'} value={avgScore || '-'} subtext={`${language === 'id' ? 'Peringkat' : 'Grade'}: ${currentGrade}`} icon={Award} colorClass="bg-indigo-500" onClick={() => setActiveTab('my_report')} /></div>
-           <div className="w-[calc(50%-0.375rem)] sm:w-[calc(33.333%-0.667rem)] lg:w-[calc(20%-0.8rem)]"><KPICard title={language === 'id' ? 'Status SPP' : 'Payment Status'} value={paymentStatusText} subtext={paymentTarget > 0 ? `Target: Rp ${paymentTarget.toLocaleString()}` : (language === 'id' ? 'Biaya SPP' : "Tuition fee")} icon={DollarSign} colorClass={isPaid ? "bg-emerald-500" : isPartial ? "bg-yellow-500" : "bg-rose-500"} onClick={() => setActiveTab('my_payments')} /></div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 sm:gap-4">
+           <KPICard title={language === 'id' ? 'Kehadiran' : 'Attendance'} value={`${attRateThisMonth}%`} subtext={`${presentThisMonth} ${language === 'id' ? 'sesi dihadiri' : 'sessions attended'}`} icon={UserCheck} colorClass={attRateThisMonth >= 80 ? "bg-emerald-500" : "bg-amber-500"} onClick={() => setActiveTab('my_attendance')} />
+           <KPICard title={language === 'id' ? 'Tugas' : 'Assignments'} value={pendingAss} subtext={pendingAss > 0 ? (language === 'id' ? "Batas waktu bulan ini" : "Due this month") : (language === 'id' ? "Semua selesai!" : "All caught up!")} icon={CheckSquare} colorClass={pendingAss === 0 ? "bg-emerald-500" : "bg-rose-500"} onClick={() => setActiveTab('my_assessments')} />
+           <KPICard title={language === 'id' ? 'Jurnal Belajar' : 'Learning Journal'} value={journalEntriesThisMonth} subtext={language === 'id' ? 'Total entri' : "Total entries"} icon={BookOpen} colorClass="bg-purple-500" onClick={() => setActiveTab('my_journals')} />
+           <KPICard title={language === 'id' ? 'Nilai Akademik' : 'Academic Score'} value={avgScore || '-'} subtext={`${language === 'id' ? 'Peringkat' : 'Grade'}: ${currentGrade}`} icon={Award} colorClass="bg-indigo-500" onClick={() => setActiveTab('my_report')} />
+           <KPICard title={language === 'id' ? 'Status SPP' : 'Payment Status'} value={paymentStatusText} subtext={paymentTarget > 0 ? `Target: Rp ${paymentTarget.toLocaleString()}` : (language === 'id' ? 'Biaya SPP' : "Tuition fee")} icon={DollarSign} colorClass={isPaid ? "bg-emerald-500" : isPartial ? "bg-yellow-500" : "bg-rose-500"} onClick={() => setActiveTab('my_payments')} />
         </div>
 
         {/* TODAY'S ACTIVITY */}
