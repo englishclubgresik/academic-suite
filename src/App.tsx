@@ -91,6 +91,26 @@ const getTodayDateLocal = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
 
+// Helper: Hasilkan timestamp lokal perangkat dalam format "YYYY-MM-DD HH:mm:ss"
+// Menggantikan new Date().toISOString() yang selalu menghasilkan UTC (Z),
+// sehingga timestamp di System Logs, Recycle Bin, dan audit trail selalu sesuai waktu lokal.
+const getLocalTimestamp = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+};
+
+// Helper: Normalisasi berbagai format timestamp (ISO UTC "Z", ISO offset "+07:00",
+// atau sudah lokal "YYYY-MM-DD HH:mm:ss") menjadi string tampilan lokal yang seragam.
+const normalizeTimestamp = (raw) => {
+  if (!raw) return '-';
+  // Sudah format lokal "YYYY-MM-DD HH:mm:ss" — langsung pakai
+  if (typeof raw === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) return raw;
+  // ISO dengan timezone offset atau Z — parse lalu konversi ke waktu lokal
+  const d = new Date(raw);
+  if (isNaN(d.getTime())) return String(raw);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+};
+
 const MONTHS = [
   'January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December',
@@ -130,6 +150,12 @@ const calculateDaysLeft = (targetDate, todayDate) => {
   if (diff === 1) return 'Tomorrow';
   if (diff < 0) return 'Passed';
   return `${diff} Days Left`;
+};
+
+const parseSessions = (sessionStr) => {
+  if (!sessionStr) return [];
+  if (Array.isArray(sessionStr)) return sessionStr;
+  return String(sessionStr).split('|').map(s => s.trim()).filter(Boolean);
 };
 
 const getPerformanceCat = (score) => {
@@ -1406,11 +1432,12 @@ const AdminDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
          <div className="w-full overflow-x-auto custom-scrollbar">
            <table className="w-full text-left text-sm min-w-[600px] whitespace-nowrap">
              <thead className="bg-[#0B0F19] border-b border-gray-800 text-gray-400 uppercase tracking-wider text-xs font-semibold">
-               <tr><th className="p-3 sm:p-4">{language === 'id' ? 'Sesi' : 'Session'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Siswa' : 'Students'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Terkumpul (Lunas)' : 'Collected (Paid)'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Tertunda' : 'Outstanding'}</th><th className="p-3 sm:p-4 text-right">{language === 'id' ? 'Pendapatan' : 'Revenue'}</th></tr>
+               <tr><th className="p-3 sm:p-4 text-center w-12 text-gray-400">No.</th><th className="p-3 sm:p-4">{language === 'id' ? 'Sesi' : 'Session'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Siswa' : 'Students'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Terkumpul (Lunas)' : 'Collected (Paid)'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Tertunda' : 'Outstanding'}</th><th className="p-3 sm:p-4 text-right">{language === 'id' ? 'Pendapatan' : 'Revenue'}</th></tr>
              </thead>
              <tbody className="divide-y divide-gray-800">
-               {sessionRevenueData.map(row => (
+               {sessionRevenueData.map((row, idx) => (
                   <tr key={row.session} className="hover:bg-[#0A0E17] transition-colors">
+                    <td className="p-3 sm:p-4 text-center text-gray-500 font-medium">{idx + 1}</td>
                     <td className="p-3 sm:p-4 font-bold text-white text-xs sm:text-sm">{row.session}</td>
                     <td className="p-3 sm:p-4 text-center text-gray-300">{row.students}</td>
                     <td className="p-3 sm:p-4 text-center text-emerald-400 font-bold">{row.collected}</td>
@@ -1494,7 +1521,7 @@ const AdminDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
          <div className="w-full overflow-x-auto custom-scrollbar max-h-[400px]">
             <table className="w-full text-left text-sm min-w-[600px] whitespace-nowrap">
                <thead className="bg-[#0B0F19] border-b border-gray-800 text-gray-400 uppercase tracking-wider text-xs font-semibold sticky top-0 z-10">
-                  <tr><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Status Peringkat' : 'Rank Status'}</th><th className="p-3 sm:p-4">{language === 'id' ? 'Nama Siswa' : 'Student Name'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Sesi' : 'Session'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Tingkat/Level' : 'Tier/Level'}</th><th className="p-3 sm:p-4 text-right">{language === 'id' ? 'Total EXP' : 'Total EXP'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Aksi' : 'Action'}</th></tr>
+                  <tr><th className="p-3 sm:p-4 text-center w-12 text-gray-400">No.</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Status Peringkat' : 'Rank Status'}</th><th className="p-3 sm:p-4">{language === 'id' ? 'Nama Siswa' : 'Student Name'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Sesi' : 'Session'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Tingkat/Level' : 'Tier/Level'}</th><th className="p-3 sm:p-4 text-right">{language === 'id' ? 'Total EXP' : 'Total EXP'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Aksi' : 'Action'}</th></tr>
                </thead>
                <tbody className="divide-y divide-gray-800">
                   {db.students.filter(s => s.status === 'Active' || s.active === 'Active')
@@ -1507,6 +1534,7 @@ const AdminDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                        const BadgeIcon = badge.icon;
                        return (
                          <tr key={s.id} className="hover:bg-[#0A0E17] transition-colors">
+                            <td className="p-3 sm:p-4 text-center text-gray-500 font-medium">{idx + 1}</td>
                             <td className="p-3 sm:p-4 text-center">
                                <div className={`inline-flex items-center justify-center gap-1.5 px-2.5 py-1 rounded-lg border border-white/5 shadow-sm min-w-[120px] ${badge.bg} ${badge.color}`}>
                                    <BadgeIcon size={14} className={badge.color} />
@@ -1579,9 +1607,9 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
   const currentYear = String(dObj.getFullYear());
   const monthPrefix = `${currentYear}-${currentMonth.padStart(2, '0')}`;
 
-  const mySession = user.teachingSession;
+  const mySessions = parseSessions(user.teachingSession);
   const activeStudents = db.students.filter(s => s.status === 'Active');
-  const myStudents = activeStudents.filter(s => getStudentSession(s) === mySession).length;
+  const myStudents = activeStudents.filter(s => mySessions.includes(getStudentSession(s))).length;
 
   // Helper for Co-Teaching: Memisahkan string "Tutor A & Tutor B" untuk mencocokkan nama
   const isMyClass = (tutorString, myName) => tutorString && tutorString.split(' & ').includes(myName);
@@ -1608,12 +1636,12 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
   const journalsToday = db.journals.filter(j => j.tutorName === user.name && j.date === today).length;
   const pendingJournals = Math.max(0, todayClassesCount - journalsToday);
 
-  const studentsInSessionIds = activeStudents.filter(s => getStudentSession(s) === mySession).map(s => s.id);
+  const studentsInSessionIds = activeStudents.filter(s => mySessions.includes(getStudentSession(s))).map(s => s.id);
   const attThisMonth = db.studentAttendance.filter(a => a.date.startsWith(monthPrefix) && studentsInSessionIds.includes(a.studentId));
   const attPresent = attThisMonth.filter(a => a.status === 'Present').length;
   const attendanceRate = attThisMonth.length > 0 ? Math.round((attPresent / attThisMonth.length) * 100) : 0;
 
-  const assessmentsDone = db.assessments.filter(a => Number(a.month) === Number(currentMonth) && String(a.year) === String(currentYear) && a.sessionGroup === mySession).length;
+  const assessmentsDone = db.assessments.filter(a => Number(a.month) === Number(currentMonth) && String(a.year) === String(currentYear) && mySessions.includes(a.sessionGroup)).length;
   const assessmentsPending = Math.max(0, myStudents - assessmentsDone);
 
   const classesCompletedMonth = db.calendar.filter(c => isMyClass(c.tutor, user.name) && c.date.startsWith(monthPrefix) && c.date <= today).length;
@@ -1621,7 +1649,7 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
   const teachingHours = classesCompletedMonth * 1;
 
   // PERBAIKAN: Hanya tampilkan progress bar untuk kelas yang diajarkan oleh tutor ini saja
-  const classProgressData = [mySession].map(session => {
+  const classProgressData = (mySessions.length > 0 ? mySessions : [user.teachingSession]).map(session => {
      const studentsInSess = db.students.filter(s => s.status === 'Active' && getStudentSession(s) === session).length;
      // Fix #10: hitung unique studentId saja (cegah duplicate assessment inflating progress > 100%)
      const uniqueAssessed = new Set(
@@ -1758,15 +1786,15 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
       <Card className="p-0 overflow-hidden border-t-4 border-t-yellow-400 shadow-lg mt-4 sm:mt-6">
          <div className="p-4 sm:p-5 bg-[#0A0E17] border-b border-gray-800 flex justify-between items-center">
             <h3 className="text-base sm:text-lg font-bold text-white flex items-center gap-2"><Trophy size={20} className="text-yellow-400" /> {language === 'id' ? 'Peringkat Kelas' : 'Class Leaderboard'}</h3>
-            <span className="text-xs text-gray-400 bg-gray-800 px-3 py-1 rounded-full border border-gray-700">{mySession}</span>
+            <div className="flex flex-wrap gap-1">{mySessions.map(s => <span key={s} className="text-xs text-gray-400 bg-gray-800 px-3 py-1 rounded-full border border-gray-700">{s}</span>)}</div>
          </div>
          <div className="w-full overflow-x-auto custom-scrollbar max-h-[350px]">
             <table className="w-full text-left text-sm min-w-[500px] whitespace-nowrap">
                <thead className="bg-[#0B0F19] border-b border-gray-800 text-gray-400 uppercase tracking-wider text-xs font-semibold sticky top-0 z-10">
-                  <tr><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Status Peringkat' : 'Rank Status'}</th><th className="p-3 sm:p-4">{language === 'id' ? 'Nama Siswa' : 'Student Name'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Tingkat/Level' : 'Tier/Level'}</th><th className="p-3 sm:p-4 text-right">{language === 'id' ? 'Total EXP' : 'Total EXP'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Aksi' : 'Action'}</th></tr>
+                  <tr><th className="p-3 sm:p-4 text-center w-12 text-gray-400">No.</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Status Peringkat' : 'Rank Status'}</th><th className="p-3 sm:p-4">{language === 'id' ? 'Nama Siswa' : 'Student Name'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Tingkat/Level' : 'Tier/Level'}</th><th className="p-3 sm:p-4 text-right">{language === 'id' ? 'Total EXP' : 'Total EXP'}</th><th className="p-3 sm:p-4 text-center">{language === 'id' ? 'Aksi' : 'Action'}</th></tr>
                </thead>
                <tbody className="divide-y divide-gray-800">
-                  {activeStudents.filter(s => getStudentSession(s) === mySession)
+                  {activeStudents.filter(s => mySessions.includes(getStudentSession(s)))
                     .map(s => ({ ...s, exp: calculateStudentEXP(s.id, db) }))
                     .sort((a,b) => b.exp - a.exp)
                     .map((s, idx) => {
@@ -1775,6 +1803,7 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                        const BadgeIcon = badge.icon;
                        return (
                          <tr key={s.id} className="hover:bg-[#0A0E17] transition-colors">
+                            <td className="p-3 sm:p-4 text-center text-gray-500 font-medium">{idx + 1}</td>
                             <td className="p-3 sm:p-4 text-center">
                                <div className={`inline-flex items-center justify-center gap-1.5 px-2.5 py-1 rounded-lg border border-white/5 shadow-sm min-w-[120px] ${badge.bg} ${badge.color}`}>
                                    <BadgeIcon size={14} className={badge.color} />
@@ -1912,45 +1941,57 @@ const normalizeData = (data) => {
    // Google Sheets menyimpan time/date sebagai UTC — membacanya dengan getHours()
    // (local time) menyebabkan geser ±7 jam di WIB.
    const fixTime = (t) => {
-      if (typeof t === 'string' && t.includes('T') && t.includes('Z')) {
-         const d = new Date(t);
-         if (!isNaN(d.getTime())) {
-            let hours = d.getUTCHours();
-            let minutes = d.getUTCMinutes();
-            let seconds = d.getUTCSeconds();
-            // Kompensasi bug zona waktu Batavia (LMT +07:07:12) sebelum tahun 1900
-            if (d.getUTCFullYear() <= 1901 && (seconds !== 0 || minutes % 5 !== 0)) {
-               minutes += 7;
-               seconds += 12;
-               if (seconds >= 60) { seconds -= 60; minutes += 1; }
-               if (minutes >= 60) { minutes -= 60; hours += 1; }
+      if (typeof t === 'string' && t.includes('T')) {
+         if (t.includes('Z')) {
+            // Logika lama untuk menangani sisa cache format UTC 
+            const d = new Date(t);
+            if (!isNaN(d.getTime())) {
+               let hours = d.getUTCHours();
+               let minutes = d.getUTCMinutes();
+               let seconds = d.getUTCSeconds();
+               // Kompensasi bug zona waktu Batavia (LMT +07:07:12) sebelum tahun 1900
+               if (d.getUTCFullYear() <= 1901 && (seconds !== 0 || minutes % 5 !== 0)) {
+                  minutes += 7;
+                  seconds += 12;
+                  if (seconds >= 60) { seconds -= 60; minutes += 1; }
+                  if (minutes >= 60) { minutes -= 60; hours += 1; }
+               }
+               minutes = Math.round(minutes / 5) * 5;
+               if (minutes >= 60) { minutes = 0; hours += 1; }
+               hours = hours % 24;
+               return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
             }
-            // Pembulatan ke 5 menit terdekat untuk membersihkan sisa angka aneh
-            minutes = Math.round(minutes / 5) * 5;
-            if (minutes >= 60) { minutes = 0; hours += 1; }
-            hours = hours % 24;
-            return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+         } else {
+            // Logika baru: Ekstrak HH:mm langsung dari format ISO ber-offset (+07:00)
+            const timePart = t.split('T')[1];
+            if (timePart) {
+               return timePart.substring(0, 5);
+            }
          }
       }
       return t;
    };
-
    const fixDate = (dStr) => {
-      if (typeof dStr === 'string' && dStr.includes('T') && dStr.includes('Z')) {
-         const d = new Date(dStr);
-         if (!isNaN(d.getTime())) {
-            // BUGFIX #5: Gunakan getUTC* agar tanggal tidak geser 1 hari
-            return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+      if (typeof dStr === 'string' && dStr.includes('T')) {
+         if (dStr.includes('Z')) {
+            // Konversi cache format UTC lama
+            const d = new Date(dStr);
+            if (!isNaN(d.getTime())) {
+               return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+            }
+         } else {
+            // Ambil langsung YYYY-MM-DD dari format offset baru dari Code.gs
+            return dStr.split('T')[0];
          }
       }
       return dStr;
    };
-
    const fixDateTime = (dStr) => {
-      if (typeof dStr === 'string' && dStr.includes('T') && dStr.includes('Z')) {
+      if (typeof dStr === 'string' && dStr.includes('T')) {
+         // Biarkan Date parsing menangani string offset valid terbaru dengan zona waktu otomatis browser
          const d = new Date(dStr);
          if (!isNaN(d.getTime())) {
-            const _l=d; return `${String(_l.getDate()).padStart(2,'0')}/${String(_l.getMonth()+1).padStart(2,'0')}/${_l.getFullYear()}, ${String(_l.getHours()).padStart(2,'0')}:${String(_l.getMinutes()).padStart(2,'0')}`;
+            return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}, ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
          }
       }
       return dStr;
@@ -2038,7 +2079,7 @@ const normalizeData = (data) => {
          role: 'super admin',
          name: 'Vicky',
          active: 'Active',
-         mustChangePassword: false
+         mustChangePassword: true  // FIX: Paksa ganti password default saat pertama login
       });
    }
    
@@ -2791,7 +2832,7 @@ function MainApp() {
         const binItem = {
           binId: `BIN-${Date.now()}`,
           originalCollection: collection,
-          deletedAt: new Date().toISOString(),
+          deletedAt: getLocalTimestamp(),
           data: item,
         };
         setDb((prev) => ({
@@ -3151,14 +3192,14 @@ function MainApp() {
       
       // 4. Monthly Assessments (Jumlah murid aktif - jumlah form nilai yang disubmit bulan ini)
       const activeStudents = db.students.filter(s => s.status === 'Active');
-      const mySession = currentUser.teachingSession;
-      const myStudents = activeStudents.filter(s => getStudentSession(s) === mySession).length;
-      const assessmentsDone = db.assessments.filter(a => Number(a.month) === Number(currentMonth) && String(a.year) === String(currentYear) && a.sessionGroup === mySession).length;
+      const mySessions = parseSessions(currentUser.teachingSession);
+      const myStudents = activeStudents.filter(s => mySessions.includes(getStudentSession(s))).length;
+      const assessmentsDone = db.assessments.filter(a => Number(a.month) === Number(currentMonth) && String(a.year) === String(currentYear) && mySessions.includes(a.sessionGroup)).length;
       counts.assessments = Math.max(0, myStudents - assessmentsDone);
       
       // 5. Materials & Tasks (Menghitung submission / komentar siswa yang belum ditandai checked/read)
       let pendingMaterialsCount = 0;
-      (db.materials || []).filter(m => m.sessionGroup === currentUser.teachingSession).forEach(mat => {
+      (db.materials || []).filter(m => parseSessions(currentUser.teachingSession).includes(m.sessionGroup)).forEach(mat => {
          pendingMaterialsCount += (mat.submissions || []).filter(sub => !sub.checked).length;
       });
       counts.materials = pendingMaterialsCount;
@@ -3249,6 +3290,13 @@ function MainApp() {
   ];
 
   const renderContent = () => {
+    // SECURITY: Pastikan tab yang diminta sesuai dengan role user.
+    // Nav sidebar sudah memfilter tampilan, tapi tanpa guard ini setActiveTab
+    // yang dipanggil dari dashboard/widget bisa membuka tab yang tidak diizinkan.
+    const allowedTab = NAVIGATION.find(n => n.id === activeTab);
+    if (allowedTab && !allowedTab.roles.includes(currentUser.role)) {
+      return <div className="p-8 text-center text-gray-400">Access denied.</div>;
+    }
     switch (activeTab) {
       case 'dashboard':
         return <Dashboard db={db} setDb={setDb} user={currentUser} setActiveTab={setActiveTab} isCloudConnected={isCloudConnected} language={language} showToast={showToast} />;
@@ -3294,10 +3342,10 @@ function MainApp() {
             language={language}
         />
       );
-    case 'my_payments': // STUDENT: Read Only Payments
-      return <StudentReadOnlyPaymentModule db={db} user={currentUser} downloadPNG={downloadPNG} handleShareImage={handleShareImage} language={language} showToast={showToast} />;
-    case 'payroll':
-      return (
+      case 'my_payments': // STUDENT: Read Only Payments
+        return <StudentReadOnlyPaymentModule db={db} user={currentUser} downloadPNG={downloadPNG} handleShareImage={handleShareImage} language={language} showToast={showToast} />;
+      case 'payroll':
+        return (
           <PayrollModule
             db={db}
             setDb={setDb}
@@ -3575,17 +3623,17 @@ export default function App() {
 
 function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) {
   const validLevelsForTutor = user?.role === 'tutor' 
-    ? LEVELS.filter(lvl => (CLASS_MAPPING[lvl] || []).some(cls => getSessionGroup(cls) === user.teachingSession))
+    ? LEVELS.filter(lvl => (CLASS_MAPPING[lvl] || []).some(cls => parseSessions(user.teachingSession).includes(getSessionGroup(cls))))
     : LEVELS;
   const defaultLevel = validLevelsForTutor.length > 0 ? validLevelsForTutor[0] : LEVELS[0];
-  const defaultClass = CLASS_MAPPING[defaultLevel].find(cls => user?.role === 'tutor' ? getSessionGroup(cls) === user.teachingSession : true) || CLASS_MAPPING[defaultLevel][0];
+  const defaultClass = CLASS_MAPPING[defaultLevel].find(cls => user?.role === 'tutor' ? parseSessions(user.teachingSession).includes(getSessionGroup(cls)) : true) || CLASS_MAPPING[defaultLevel][0];
   
   const [formData, setFormData] = useState({ id: '', name: '', gender: 'Male', level: defaultLevel, class: defaultClass, paymentPlan: 'Monthly', status: 'Active', teacherComment: '', sessionOverride: 'Default', enrollmentStatus: 'Returning', whatsapp: '' });
   const [isAdding, setIsAdding] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const debouncedSearchTerm = useDebounce(searchTerm, 300);
   const [filterLevel, setFilterLevel] = useState('');
-  const [filterSession, setFilterSession] = useState(user?.role === 'tutor' ? user.teachingSession : '');
+  const [filterSession, setFilterSession] = useState('');
   const [filterClass, setFilterClass] = useState('');
 
   const [rowsPerPage, setRowsPerPage] = useState<number | string>(10);
@@ -3595,7 +3643,7 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
     if (!formData.id && formData.level) {
       const availableClasses = CLASS_MAPPING[formData.level] || [];
       const validClasses = user?.role === 'tutor' 
-         ? availableClasses.filter(cls => getSessionGroup(cls) === user.teachingSession)
+         ? availableClasses.filter(cls => parseSessions(user.teachingSession).includes(getSessionGroup(cls)))
          : availableClasses;
       setFormData(prev => ({ ...prev, class: validClasses[0] || availableClasses[0] }));
     }
@@ -3620,8 +3668,10 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
     const matchSearch = (s.name || '').toLowerCase().includes((debouncedSearchTerm || '').toLowerCase());
     const matchLevel = filterLevel ? s.level === filterLevel : true;
     const matchClass = filterClass ? s.class === filterClass : true;
+    // FIX: Untuk tutor, filterSession hanya boleh memilih dari sesi miliknya sendiri
+    // Jika filterSession kosong, tampilkan semua siswa dari semua sesi tutor (matchTutor sudah menjaga scope)
     const matchSessionFilter = filterSession ? getStudentSession(s) === filterSession : true;
-    const matchTutor = user?.role === 'tutor' ? getStudentSession(s) === user.teachingSession : true;
+    const matchTutor = user?.role === 'tutor' ? parseSessions(user.teachingSession).includes(getStudentSession(s)) : true;
     return matchSearch && matchLevel && matchClass && matchSessionFilter && matchTutor;
   }));
 
@@ -3664,7 +3714,7 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
               <Input label="Level" type="select" options={validLevelsForTutor} value={formData.level} onChange={(v) => setFormData({ ...formData, level: v })} required />
-              <Input label="Class" type="select" options={(CLASS_MAPPING[formData.level] || []).filter(cls => user?.role === 'tutor' ? getSessionGroup(cls) === user.teachingSession : true)} value={formData.class} onChange={(v) => setFormData({ ...formData, class: v })} required />
+              <Input label="Class" type="select" options={(CLASS_MAPPING[formData.level] || []).filter(cls => user?.role === 'tutor' ? parseSessions(user.teachingSession).includes(getSessionGroup(cls)) : true)} value={formData.class} onChange={(v) => setFormData({ ...formData, class: v })} required />
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
               <Input label="Payment Plan" type="select" options={['Monthly', 'Per Visit']} value={formData.paymentPlan} onChange={(v) => setFormData({ ...formData, paymentPlan: v })} required />
@@ -3690,16 +3740,18 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
           </select>
           <select className="w-full bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all" value={filterClass} onChange={(e) => setFilterClass(e.target.value)} disabled={!filterLevel}>
             <option value="">All Classes</option>
-            {filterLevel && (CLASS_MAPPING[filterLevel] || []).filter(cls => user?.role === 'tutor' ? getSessionGroup(cls) === user.teachingSession : true).map((c) => <option key={c} value={c}>{c}</option>)}
+            {filterLevel && (CLASS_MAPPING[filterLevel] || []).filter(cls => user?.role === 'tutor' ? parseSessions(user.teachingSession).includes(getSessionGroup(cls)) : true).map((c) => <option key={c} value={c}>{c}</option>)}
           </select>
           <select 
-            className={`w-full bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-[#00D4FF] ${user?.role === 'tutor' ? 'opacity-70 cursor-not-allowed' : ''}`} 
+            className="w-full bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-[#00D4FF]" 
             value={filterSession} 
             onChange={(e) => setFilterSession(e.target.value)}
-            disabled={user?.role === 'tutor'}
           >
             {user?.role === 'tutor' ? (
-              <option value={user.teachingSession}>{user.teachingSession} (Locked)</option>
+              <>
+                <option value="">All My Sessions</option>
+                {parseSessions(user.teachingSession).map((s) => <option key={s} value={s}>{s}</option>)}
+              </>
             ) : (
               <>
                 <option value="">All Sessions</option>
@@ -3960,7 +4012,7 @@ function StudentAttendanceModule({ db, setDb, showToast, softDelete, user, gener
           <tbody className="divide-y divide-gray-800">
             {studentsToMark.length > 0 ? studentsToMark.map((s, index) => (
               <tr key={s.id} className="hover:bg-[#0B0F19]">
-                <td className="p-4 text-center text-gray-500 font-medium">{index + 1}</td>
+                <td className="p-4 text-center"><span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-[#00D4FF]/10 border border-[#00D4FF]/20 text-[11px] font-black text-[#00D4FF]">{String(index + 1).padStart(2, '0')}</span></td>
                 <td className="p-4 text-white font-medium"><div className="flex items-center">{s.name} <NewBadge isNew={s.enrollmentStatus} /> <span className="text-xs text-gray-500 ml-1.5">({s.class})</span>{checkHasDebt(s.id, selectedSchedule?.date) && <span title="Memiliki tunggakan pembayaran"><AlertCircle size={14} className="text-amber-500 ml-2" /></span>}</div></td>
                 {['Present', 'Sick', 'Excused', 'Absent'].map((status) => (
                   <td key={status} className="p-4 text-center">
@@ -4090,7 +4142,7 @@ function TutorAttendanceModule({ db, setDb, user, showToast, softDelete, generat
               status: editStatus,
               // Fix #3: audit trail — record who changed the status and when
               lastEditedBy: user.name,
-              lastEditedAt: new Date().toISOString(),
+              lastEditedAt: getLocalTimestamp(),
               originalStatus: a.originalStatus || a.status,
             }
           : a
@@ -4211,12 +4263,12 @@ function TutorAttendanceModule({ db, setDb, user, showToast, softDelete, generat
 }
 
 function AssessmentsModule({ db, setDb, generateId, showToast, user }) {
-  const defaultSession = user?.role === 'tutor' ? user.teachingSession : SESSIONS[0];
+  const defaultSession = user?.role === 'tutor' ? (parseSessions(user.teachingSession)[0] || SESSIONS[0]) : SESSIONS[0];
   const [month, setMonth] = useState(new Date().getMonth() + 1);
   const [year, setYear] = useState(new Date().getFullYear());
   const [sessionGroup, setSessionGroup] = useState(defaultSession);
   const [tableData, setTableData] = useState({});
-  const [materialFilterSession, setMaterialFilterSession] = useState(user?.role === 'tutor' ? user.teachingSession : 'All');
+  const [materialFilterSession, setMaterialFilterSession] = useState('All');
 
   const activeStudents = useMemo(() => sortStudentsLogically(db.students.filter((s) => s.status === 'Active')), [db.students]);
   const targetStudents = useMemo(() => activeStudents.filter((s) => getStudentSession(s) === sessionGroup), [activeStudents, sessionGroup]);
@@ -4320,20 +4372,22 @@ function AssessmentsModule({ db, setDb, generateId, showToast, user }) {
       <div className="flex flex-col md:flex-row gap-3 items-stretch md:items-center bg-[#0A0E17] p-4 sm:p-5 rounded-xl border border-gray-800 shadow-sm flex-wrap">
         <Input label="Month" type="select" options={MONTHS.map((m, i) => ({ value: i + 1, label: m }))} value={month} onChange={setMonth} className="mb-0" />
         <Input label="Year" type="number" value={year} onChange={setYear} className="mb-0" />
-        <Input label="Session" type="select" options={user?.role === 'tutor' ? [user.teachingSession] : SESSIONS} value={sessionGroup} onChange={setSessionGroup} className="mb-0" disabled={user?.role === 'tutor'} />
+        <Input label="Session" type="select" options={user?.role === 'tutor' ? parseSessions(user.teachingSession) : SESSIONS} value={sessionGroup} onChange={setSessionGroup} className="mb-0" />
       </div>
 
       <div className="bg-[#151B26] border border-gray-800 rounded-xl shadow-sm overflow-hidden mb-6">
         <div className="p-4 border-b border-gray-800 bg-[#0A0E17] flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
           <h3 className="text-white font-bold text-sm">Learning Materials (From Journals)</h3>
           <select
-            className="bg-[#0B0F19] border border-gray-700 rounded-lg px-3 py-1.5 text-white text-sm focus:outline-none focus:border-[#00D4FF] disabled:opacity-50"
+            className="bg-[#0B0F19] border border-gray-700 rounded-lg px-3 py-1.5 text-white text-sm focus:outline-none focus:border-[#00D4FF]"
             value={materialFilterSession}
             onChange={e => setMaterialFilterSession(e.target.value)}
-            disabled={user?.role === 'tutor'}
           >
             {user?.role === 'tutor' ? (
-               <option value={user.teachingSession}>{user.teachingSession}</option>
+               <>
+                 <option value="All">All My Sessions</option>
+                 {parseSessions(user.teachingSession).map(s => <option key={s} value={s}>{s}</option>)}
+               </>
             ) : (
                <>
                  <option value="All">All Sessions</option>
@@ -4887,8 +4941,9 @@ function HistoryReportsModule({ db, setDb, showToast, handlePrint, user }) {
   const filteredStudents = useMemo(() => {
      return sortStudentsLogically(db.students.filter((s) => {
        const matchSearch = (s.name || '').toLowerCase().includes((debouncedSearchTerm || '').toLowerCase());
+       // FIX: Untuk tutor, matchTutor sudah membatasi scope ke sesinya. matchSession hanya sebagai sub-filter
        const matchSession = filterSession ? getStudentSession(s) === filterSession : true;
-       const matchTutor = user?.role === 'tutor' ? getStudentSession(s) === user.teachingSession : true;
+       const matchTutor = user?.role === 'tutor' ? parseSessions(user.teachingSession).includes(getStudentSession(s)) : true;
        const matchLevel = filterLevel ? s.level === filterLevel : true;
        const matchClass = filterClass ? s.class === filterClass : true;
        return matchSearch && matchSession && matchTutor && matchLevel && matchClass;
@@ -4898,7 +4953,8 @@ function HistoryReportsModule({ db, setDb, showToast, handlePrint, user }) {
   const filteredTutors = useMemo(() => {
      return db.tutors.filter((t) => {
        const matchSearch = (t.name || '').toLowerCase().includes((debouncedSearchTerm || '').toLowerCase());
-       const matchSession = filterSession ? t.teachingSession === filterSession : true;
+       // FIX: Gunakan parseSessions agar tutor dengan 2+ sesi (format "A|B") tetap cocok
+       const matchSession = filterSession ? parseSessions(t.teachingSession).includes(filterSession) : true;
        return matchSearch && matchSession;
      });
   }, [db.tutors, debouncedSearchTerm, filterSession]);
@@ -4944,9 +5000,12 @@ function HistoryReportsModule({ db, setDb, showToast, handlePrint, user }) {
                </>
             )}
 
-            <select className="w-full bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all" value={filterSession} onChange={(e) => setFilterSession(e.target.value)} disabled={user?.role === 'tutor'}>
+            <select className="w-full bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all" value={filterSession} onChange={(e) => setFilterSession(e.target.value)}>
               {user?.role === 'tutor' ? (
-                <option value={user.teachingSession}>{user.teachingSession}</option>
+                <>
+                  <option value="">All My Sessions</option>
+                  {parseSessions(user.teachingSession).map(s => <option key={s} value={s}>{s}</option>)}
+                </>
               ) : (
                 <>
                   <option value="">All Sessions</option>
@@ -5359,7 +5418,7 @@ function HistoryReportsModule({ db, setDb, showToast, handlePrint, user }) {
     });
     const journals = db.journals.filter((j) => j.tutorName === tutor.name && j.date >= startDate && j.date <= endDate);
     const assessments = db.assessments.filter((a) => {
-        if (a.sessionGroup !== tutor.teachingSession) return false;
+        if (!parseSessions(tutor.teachingSession).includes(a.sessionGroup)) return false;
         const assessDateStr = `${a.year}-${String(a.month).padStart(2, '0')}`;
         return assessDateStr >= startMonthStr && assessDateStr <= endMonthStr;
     });
@@ -5407,7 +5466,7 @@ function HistoryReportsModule({ db, setDb, showToast, handlePrint, user }) {
                   <h3 className="text-xs font-bold text-blue-800 border-b border-gray-200 pb-2 mb-3 uppercase flex items-center gap-2"><User size={14} /> Tutor Profile</h3>
                   <div className="grid grid-cols-2 gap-y-2 text-xs">
                     <div className="flex items-center gap-2"><span className="font-medium w-24 text-gray-500">Name</span> <span className="font-bold">{tutor.name}</span></div>
-                    <div className="flex items-center gap-2"><span className="font-medium w-24 text-gray-500">Session</span> <span className="font-bold text-[#1e3a8a]">{tutor.teachingSession}</span></div>
+                    <div className="flex items-center gap-2"><span className="font-medium w-24 text-gray-500">Session</span> <span className="font-bold text-[#1e3a8a]">{parseSessions(tutor.teachingSession).join(', ')}</span></div>
                     <div className="flex items-center gap-2"><span className="font-medium w-24 text-gray-500">Tutor ID</span> <span className="font-bold">{tutor.id}</span></div>
                     <div className="flex items-center gap-2"><span className="font-medium w-24 text-gray-500">Status</span> <span className="font-bold text-blue-700">{tutor.status}</span></div>
                     <div className="flex items-center gap-2"><span className="font-medium w-24 text-gray-500">Generated</span> <span className="font-bold">{new Date().toLocaleString('en-GB')}</span></div>
@@ -5559,6 +5618,10 @@ function TutorsModule({ db, setDb, generateId, showToast, softDelete }) {
 
   const handleSave = (e) => {
     e.preventDefault();
+    if (!formData.teachingSession || parseSessions(formData.teachingSession).length === 0) {
+      showToast('Please select at least one teaching session', 'warning');
+      return;
+    }
     // Simpan langsung dalam format internasional (628...) agar siap dipakai untuk link wa.me tanpa konversi lagi.
     const finalPhone = normalizeWhatsapp(formData.phone);
     const rec = { ...formData, phone: finalPhone, id: formData.id || generateId('TUT', 'tutors') };
@@ -5568,7 +5631,7 @@ function TutorsModule({ db, setDb, generateId, showToast, softDelete }) {
   };
 
   const filteredTutors = useMemo(() => {
-    return db.tutors.filter(t => filterSession ? t.teachingSession === filterSession : true);
+    return db.tutors.filter(t => filterSession ? parseSessions(t.teachingSession).includes(filterSession) : true);
   }, [db.tutors, filterSession]);
 
   // Pagination Logic
@@ -5614,7 +5677,29 @@ function TutorsModule({ db, setDb, generateId, showToast, softDelete }) {
 
             {/* Row 3: Teaching Session + Status */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-              <Input label="Teaching Session" type="select" options={SESSIONS} value={formData.teachingSession} onChange={v => setFormData({...formData, teachingSession: v})} required />
+              <div>
+                <label className="block text-sm text-gray-400 mb-2">Teaching Sessions <span className="text-red-400">*</span></label>
+                <div className="grid grid-cols-1 gap-2">
+                  {SESSIONS.map(s => {
+                    const checked = parseSessions(formData.teachingSession).includes(s);
+                    return (
+                      <label key={s} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${checked ? 'border-[#00D4FF]/40 bg-[#00D4FF]/5' : 'border-gray-700 hover:border-gray-600'}`}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            const cur = parseSessions(formData.teachingSession);
+                            const upd = checked ? cur.filter(x => x !== s) : [...cur, s];
+                            setFormData({...formData, teachingSession: upd.join('|')});
+                          }}
+                          className="w-4 h-4 accent-[#00D4FF] shrink-0"
+                        />
+                        <span className={`text-sm leading-tight ${checked ? 'text-white font-medium' : 'text-gray-400'}`}>{s}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
               <Input label="Status" type="select" options={['Active', 'Inactive']} value={formData.status} onChange={v => setFormData({...formData, status: v})} required />
             </div>
 
@@ -5651,7 +5736,7 @@ function TutorsModule({ db, setDb, generateId, showToast, softDelete }) {
                   <td className="p-4 text-center text-gray-500">{startIndex + i + 1}</td>
                   <td className="p-4 font-mono text-gray-400">{t.id}</td>
                   <td className="p-4 text-white font-medium">{t.name}</td>
-                  <td className="p-4 text-gray-300">{t.teachingSession}</td>
+                  <td className="p-4 text-gray-300 text-xs">{parseSessions(t.teachingSession).join(' · ') || '-'}</td>
                   <td className="p-4 text-gray-400">{t.phone}</td>
                   <td className="p-4 text-center"><Badge status={t.status} /></td>
                   <td className="p-4 text-center flex justify-center gap-2">
@@ -5701,7 +5786,7 @@ function JournalsModule({ db, setDb, user, showToast, generateId, softDelete }) 
   const [year, setYear] = useState(new Date().getFullYear());
   
   // NEW: State for Filters & Pagination
-  const [filterSession, setFilterSession] = useState(user?.role === 'tutor' ? user.teachingSession : '');
+  const [filterSession, setFilterSession] = useState('');
   const [rowsPerPage, setRowsPerPage] = useState<number | string>(10);
   const [currentPage, setCurrentPage] = useState(1);
 
@@ -5818,13 +5903,15 @@ function JournalsModule({ db, setDb, user, showToast, generateId, softDelete }) 
               <Input label="" type="number" value={year} onChange={setYear} className="mb-0 flex-1 md:w-24" />
             </div>
             <select 
-               className="w-full md:w-48 bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all disabled:opacity-50 disabled:cursor-not-allowed" 
+               className="w-full md:w-48 bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all" 
                value={filterSession} 
                onChange={(e) => setFilterSession(e.target.value)}
-               disabled={user?.role === 'tutor'}
             >
                {user?.role === 'tutor' ? (
-                 <option value={user.teachingSession}>{user.teachingSession}</option>
+                 <>
+                   <option value="">All My Sessions</option>
+                   {parseSessions(user.teachingSession).map(s => <option key={s} value={s}>{s}</option>)}
+                 </>
                ) : (
                  <>
                    <option value="">All Sessions</option>
@@ -6124,6 +6211,7 @@ function PayrollModule({ db, setDb, generateId, showToast, handlePrint, handleSh
          <table className="w-full text-left text-sm">
             <thead className="bg-[#0B0F19] border-b border-gray-800 text-gray-400 uppercase tracking-wider text-[11px] font-bold">
                <tr>
+                  <th className="p-4 text-center w-12 text-gray-400">No.</th>
                   <th className="p-4 text-center">Tutor</th>
                   <th className="p-4 text-center">Base</th>
                   <th className="p-4 text-center">Classes</th>
@@ -6135,8 +6223,9 @@ function PayrollModule({ db, setDb, generateId, showToast, handlePrint, handleSh
                </tr>
             </thead>
             <tbody className="divide-y divide-gray-800">
-               {paginatedPayroll.map(p => (
+               {paginatedPayroll.map((p, idx) => (
                   <tr key={p.id} className="hover:bg-[#0B0F19]">
+                     <td className="p-4 text-center text-gray-500 font-medium">{idx + 1}</td>
                      <td className="p-4 font-bold text-white">{p.tutorName}</td>
                      <td className="p-4 text-center text-gray-300">Rp {Number(p.baseSalary).toLocaleString()}</td>
                      <td className="p-4 text-center text-gray-400">{p.classesDone}</td>
@@ -6156,7 +6245,7 @@ function PayrollModule({ db, setDb, generateId, showToast, handlePrint, handleSh
                      </td>
                   </tr>
                ))}
-               {paginatedPayroll.length === 0 && <tr><td colSpan={8}><EmptyState icon={DollarSign} title="No payroll generated" description="No payroll records for this month yet." /></td></tr>}
+               {paginatedPayroll.length === 0 && <tr><td colSpan={9}><EmptyState icon={DollarSign} title="No payroll generated" description="No payroll records for this month yet." /></td></tr>}
             </tbody>
          </table>
          {/* Pagination Footer */}
@@ -6192,8 +6281,14 @@ function CalendarModule({ db, setDb, generateId, user, showToast, softDelete }) 
   // NEW: State for Filters & Pagination
   const [filterMonth, setFilterMonth] = useState<number | string>(new Date().getMonth() + 1);
   const [filterYear, setFilterYear] = useState(new Date().getFullYear());
+  // Untuk role student: session dikunci otomatis dari data siswa (tidak bisa diubah)
+  const studentSessionLocked = useMemo(() => {
+    if (user.role !== 'student') return '';
+    const studentRec = db.students.find(s => s.id === user.studentId);
+    return studentRec ? getStudentSession(studentRec) : '';
+  }, [user, db.students]);
   const [filterSession, setFilterSession] = useState('');
-  const [rowsPerPage, setRowsPerPage] = useState<number | string>(10);
+  const [rowsPerPage, setRowsPerPage] = useState<number | string>(user.role === 'student' ? 'All' : 10);
   const [currentPage, setCurrentPage] = useState(1);
 
   useEffect(() => {
@@ -6239,7 +6334,8 @@ function CalendarModule({ db, setDb, generateId, user, showToast, softDelete }) 
           if (!c.date.startsWith(String(filterYear))) return false;
        }
        
-       if (filterSession && c.sessionGroup !== 'All Sessions' && c.sessionGroup !== filterSession && c.name !== filterSession) return false;
+       const effectiveSessionFilter = user.role === 'student' ? studentSessionLocked : filterSession;
+       if (effectiveSessionFilter && c.sessionGroup !== 'All Sessions' && c.sessionGroup !== effectiveSessionFilter && c.name !== effectiveSessionFilter) return false;
        
        return true;
     })
@@ -6324,29 +6420,42 @@ function CalendarModule({ db, setDb, generateId, user, showToast, softDelete }) 
                    </select>
                    <input type="number" className="bg-[#151B26] border border-gray-700 rounded-lg px-3 py-2 text-sm text-white w-24 focus:border-[#00D4FF]" value={filterYear} onChange={e => setFilterYear(Number(e.target.value))} />
                </div>
-               <select className="w-full md:w-48 bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2 text-sm text-white focus:outline-none focus:border-[#00D4FF]" value={filterSession} onChange={e => setFilterSession(e.target.value)}>
-                   <option value="">All Sessions</option>
-                   {SESSIONS.map(s => <option key={s} value={s}>{s}</option>)}
-               </select>
+               {user.role === 'student' ? (
+                  <div className="flex items-center gap-2 px-4 py-2 bg-[#00D4FF]/10 border border-[#00D4FF]/30 rounded-lg text-sm text-[#00D4FF] font-medium w-full md:w-auto">
+                     <CalendarIcon size={14} className="shrink-0" />
+                     <span className="truncate">{studentSessionLocked || 'My Session'}</span>
+                  </div>
+               ) : (
+                  <select className="w-full md:w-48 bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2 text-sm text-white focus:outline-none focus:border-[#00D4FF]" value={filterSession} onChange={e => setFilterSession(e.target.value)}>
+                     <option value="">All Sessions</option>
+                     {SESSIONS.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+               )}
            </div>
            
            <div className="p-4 space-y-4 bg-[#151B26] flex-1">
-              {paginatedData.map(c => (
+              {paginatedData.map((c, idx) => (
                  <div key={c.id} className="bg-[#0B0F19] rounded-xl border border-gray-800 p-5 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-l-4 border-l-[#00D4FF] hover:border-gray-700 transition-colors">
-                    <div>
-                       <div className="flex gap-3 items-center mb-1">
-                          <span className="font-bold text-lg text-white">{c.sessionGroup || c.name}</span>
-                          <span className={`px-2 py-0.5 text-[11px] uppercase font-bold rounded ${c.type === 'Holiday' ? 'bg-red-500/20 text-red-400' : c.type === 'Exam' ? 'bg-purple-500/20 text-purple-400' : 'bg-blue-500/20 text-blue-400'}`}>{c.type}</span>
+                    <div className="flex items-start gap-4 flex-1 min-w-0">
+                       {/* Aesthetic number badge */}
+                       <div className="flex-shrink-0 w-8 h-8 rounded-full bg-[#00D4FF]/10 border border-[#00D4FF]/20 flex items-center justify-center mt-0.5">
+                          <span className="text-[11px] font-black text-[#00D4FF]">{String((currentPage - 1) * (isAll ? 0 : Number(rowsPerPage)) + idx + 1).padStart(2, '0')}</span>
                        </div>
-                       <p className="text-gray-400 text-sm flex flex-wrap gap-3">
-                          <span className="whitespace-nowrap"><CalendarIcon size={14} className="inline mr-1"/> {safeDateDisplay(c.date, 'en-GB', {weekday: 'short', day: 'numeric', month: 'short'})}</span>
-                          <span className="whitespace-nowrap"><Clock size={14} className="inline mr-1"/> {c.startTime} - {c.endTime}</span>
-                          <span className="whitespace-nowrap"><User size={14} className="inline mr-1"/> {c.tutor}</span>
-                       </p>
-                       {c.notes && <p className="text-gray-500 text-xs mt-2 italic">{c.notes}</p>}
+                       <div className="flex-1 min-w-0">
+                          <div className="flex gap-3 items-center mb-1 flex-wrap">
+                             <span className="font-bold text-lg text-white">{c.sessionGroup || c.name}</span>
+                             <span className={`px-2 py-0.5 text-[11px] uppercase font-bold rounded ${c.type === 'Holiday' ? 'bg-red-500/20 text-red-400' : c.type === 'Exam' ? 'bg-purple-500/20 text-purple-400' : 'bg-blue-500/20 text-blue-400'}`}>{c.type}</span>
+                          </div>
+                          <p className="text-gray-400 text-sm flex flex-wrap gap-3">
+                             <span className="whitespace-nowrap"><CalendarIcon size={14} className="inline mr-1"/> {safeDateDisplay(c.date, 'en-GB', {weekday: 'short', day: 'numeric', month: 'short'})}</span>
+                             <span className="whitespace-nowrap"><Clock size={14} className="inline mr-1"/> {c.startTime} - {c.endTime}</span>
+                             <span className="whitespace-nowrap"><User size={14} className="inline mr-1"/> {c.tutor}</span>
+                          </p>
+                          {c.notes && <p className="text-gray-500 text-xs mt-2 italic">{c.notes}</p>}
+                       </div>
                     </div>
                     {user.role === 'admin' && (
-                       <div className="flex gap-2">
+                       <div className="flex gap-2 flex-shrink-0">
                           <button onClick={() => { setFormData(c); setIsAdding(true); }} className="text-blue-400 p-2.5 hover:bg-blue-500/10 rounded-lg transition-colors" title="Edit Event"><Edit2 size={18}/></button>
                           <button onClick={() => softDelete('calendar', c.id, 'Calendar Event')} className="text-red-400 p-2.5 hover:bg-red-500/10 rounded-lg transition-colors" title="Delete Event"><Trash2 size={18}/></button>
                        </div>
@@ -6356,7 +6465,8 @@ function CalendarModule({ db, setDb, generateId, user, showToast, softDelete }) 
               {paginatedData.length === 0 && <p className="text-center text-gray-500 py-8">No events scheduled matching your filters.</p>}
            </div>
 
-           {/* Pagination Footer */}
+           {/* Pagination Footer - hidden for student role */}
+           {user.role !== 'student' && (
            <div className="p-4 bg-[#0A0E17] border-t border-gray-800 flex flex-col sm:flex-row justify-between items-center gap-4 text-sm text-gray-400">
                <div className="flex items-center gap-2">
                  <span>Show</span>
@@ -6377,6 +6487,7 @@ function CalendarModule({ db, setDb, generateId, user, showToast, softDelete }) 
                  </div>
                )}
            </div>
+           )}
         </Card>
      </div>
   );
@@ -6433,15 +6544,18 @@ function AnnouncementsModule({ db, setDb, generateId, user, showToast, softDelet
            </Card>
         )}
         <div className="space-y-4">
-           {paginatedData.map(a => (
+           {paginatedData.map((a, idx) => (
               <Card key={a.id} className="border-l-4 border-l-yellow-400 p-5">
                  <div className="flex justify-between items-start mb-3">
-                    <div>
-                       <h3 className="text-xl font-bold text-white">{a.title}</h3>
-                       <p className="text-xs text-gray-500 uppercase tracking-widest mt-1">{a.date} • By {a.author}</p>
+                    <div className="flex items-start gap-3">
+                       <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-yellow-400/10 border border-yellow-400/30 text-[11px] font-black text-yellow-400 shrink-0 mt-0.5">{String(idx + 1).padStart(2, '0')}</span>
+                       <div>
+                          <h3 className="text-xl font-bold text-white">{a.title}</h3>
+                          <p className="text-xs text-gray-500 uppercase tracking-widest mt-1">{a.date} • By {a.author}</p>
+                       </div>
                     </div>
                     {user.role === 'admin' && (
-                       <div className="flex gap-2">
+                       <div className="flex gap-2 shrink-0">
                           <button onClick={() => { setFormData(a); setIsAdding(true); }} className="text-blue-400 p-2.5 hover:bg-blue-500/10 rounded-lg transition-colors" title="Edit Post"><Edit2 size={18}/></button>
                           <button onClick={() => softDelete('announcements', a.id, 'Announcement')} className="text-red-400 p-2.5 hover:bg-red-500/10 rounded-lg transition-colors" title="Delete Post"><Trash2 size={18}/></button>
                        </div>
@@ -7102,7 +7216,7 @@ function AccountSettingsModule({ db, setDb, user, setCurrentUser, showToast, lan
                <>
                  <div>
                     <p className="text-xs text-gray-500 uppercase tracking-widest font-bold mb-1">{language === 'id' ? 'Sesi Mengajar' : 'Teaching Session'}</p>
-                    <p className="text-white font-medium bg-[#0B0F19] px-4 py-2.5 rounded-lg border border-gray-800">{profileDetails.teachingSession}</p>
+                    <p className="text-white font-medium bg-[#0B0F19] px-4 py-2.5 rounded-lg border border-gray-800">{parseSessions(profileDetails.teachingSession).join(' · ') || '-'}</p>
                  </div>
                  {profileDetails.phone && (
                    <div>
@@ -7175,7 +7289,7 @@ function StudentReadOnlyAttendanceModule({ db, user, language = 'en' }) {
           <tbody className="divide-y divide-gray-800">
             {myAtt.length > 0 ? myAtt.map((a, index) => (
               <tr key={a.id} className="hover:bg-[#0B0F19]">
-                <td className="p-4 text-center text-gray-500 font-medium">{index + 1}</td>
+                <td className="p-4 text-center"><span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-[#00D4FF]/10 border border-[#00D4FF]/20 text-[11px] font-black text-[#00D4FF]">{String(index + 1).padStart(2, '0')}</span></td>
                 <td className="p-4 text-center font-medium text-white">{a.date}</td>
                 <td className="p-4 text-center text-gray-400">{a.sessionGroup}</td>
                 <td className="p-4 text-center"><Badge status={a.status} /></td>
@@ -7229,14 +7343,17 @@ function StudentReadOnlyJournalsModule({ db, user, language = 'en' }) {
            </div>
         </div>
         <div className="p-4 sm:p-5 space-y-4 bg-[#151B26]">
-        {myJournals.length > 0 ? myJournals.map(j => (
+        {myJournals.length > 0 ? myJournals.map((j, idx) => (
           <div key={j.id} className="bg-[#0B0F19] border border-[#00D4FF]/20 rounded-xl shadow-md p-5">
             <div className="flex justify-between items-start mb-2">
-              <div>
-                 <h3 className="text-lg font-bold text-white">{j.topic}</h3>
-                 <p className="text-[#00D4FF] text-sm">Tutor: {j.tutorName}</p>
+              <div className="flex items-start gap-3">
+                 <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-[#00D4FF]/10 border border-[#00D4FF]/20 text-[11px] font-black text-[#00D4FF] shrink-0 mt-0.5">{String(idx + 1).padStart(2, '0')}</span>
+                 <div>
+                    <h3 className="text-lg font-bold text-white">{j.topic}</h3>
+                    <p className="text-[#00D4FF] text-sm">Tutor: {j.tutorName}</p>
+                 </div>
               </div>
-              <span className="text-xs text-gray-400">{j.date}</span>
+              <span className="text-xs text-gray-400 shrink-0 ml-2">{j.date}</span>
             </div>
             <div className="mt-4 pt-4 border-t border-gray-800">
               <p className="text-sm text-gray-300"><strong>{language === 'id' ? 'Aktivitas:' : 'Activities:'}</strong> {j.activities}</p>
@@ -7293,7 +7410,7 @@ function StudentReadOnlyAssessmentModule({ db, user, language = 'en' }) {
           <tbody className="divide-y divide-gray-800">
             {myAssessments.length > 0 ? myAssessments.map((a, index) => (
               <tr key={a.id} className="hover:bg-[#0B0F19]">
-                <td className="p-4 text-center text-gray-500 font-medium">{index + 1}</td>
+                <td className="p-4 text-center"><span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-[#00D4FF]/10 border border-[#00D4FF]/20 text-[11px] font-black text-[#00D4FF]">{String(index + 1).padStart(2, '0')}</span></td>
                 <td className="p-4 text-center font-medium text-white">{MONTHS[parseInt(a.month)-1]} {a.year}</td>
                 <td className="p-4 text-center font-bold text-[#00D4FF] text-lg">{a.average}</td>
                 <td className="p-4 text-center font-bold text-white text-lg">{a.grade}</td>
@@ -7490,7 +7607,7 @@ function StudentReadOnlyPaymentModule({ db, user, downloadPNG, handleShareImage,
           <tbody className="divide-y divide-gray-800">
             {myPayments.length > 0 ? myPayments.map((p, index) => (
               <tr key={p.id} className="hover:bg-[#0B0F19]">
-                <td className="p-4 text-center text-gray-500 font-medium">{index + 1}</td>
+                <td className="p-4 text-center"><span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-[#00D4FF]/10 border border-[#00D4FF]/20 text-[11px] font-black text-[#00D4FF]">{String(index + 1).padStart(2, '0')}</span></td>
                 <td className="p-4 text-center font-mono text-gray-500 text-xs">{p.id}</td>
                 <td className="p-4 text-center font-medium text-white">{MONTHS[parseInt(p.month)-1]} {p.year}</td>
                 <td className="p-4 text-center font-bold text-green-400">Rp {Number(p.amount).toLocaleString()}</td>
@@ -8929,7 +9046,7 @@ function DataExportModule({ db }) {
       ['ID', 'Nama', 'Spesialisasi / Sesi Mengajar', 'No. Telp / WA', 'Status', 'Total Sesi Hadir'],
       db.tutors.map((t) => {
         const totalSessions = db.tutorAttendance.filter((a) => a.tutorId === t.id && a.status === 'Present').length;
-        return [t.id, t.name, t.teachingSession || '', t.phone || '', t.status || '', totalSessions];
+        return [t.id, t.name, parseSessions(t.teachingSession).join(', ') || '', t.phone || '', t.status || '', totalSessions];
       }),
       { centerCols: [4, 5] }
     );
@@ -9174,7 +9291,7 @@ function RecycleBinModule({ db, setDb, showToast, requestConfirm }) {
                     />
                   </td>
                   <td className="p-4 text-center text-gray-500 font-medium">{startIndex + index + 1}</td>
-                  <td className="p-4 text-center">{new Date(b.deletedAt).toLocaleString()}</td>
+                  <td className="p-4 text-center">{normalizeTimestamp(b.deletedAt)}</td>
                   <td className="p-4 text-center capitalize text-[#00D4FF] font-medium">{b.originalCollection}</td>
                   <td className="p-4 text-center text-gray-400 max-w-xs truncate">{JSON.stringify(b.data)}</td>
                   <td className="p-4 text-center flex justify-center gap-2">
@@ -9310,13 +9427,7 @@ function SystemLogsModule({ logs, setLogs, showToast, requestConfirm }) {
               </thead>
               <tbody className="divide-y divide-gray-800/50">
                  {paginatedData.map((log, idx) => {
-                    let displayTime = log.Timestamp;
-                    if (typeof displayTime === 'string' && displayTime.includes('T') && displayTime.includes('Z')) {
-                       const d = new Date(displayTime);
-                       if (!isNaN(d.getTime())) {
-                          displayTime = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
-                       }
-                    }
+                    let displayTime = normalizeTimestamp(log.Timestamp);
                     return (
                     <tr key={idx} className="hover:bg-[#1A2234] transition-colors font-mono text-[13px]">
                        <td className="p-4 text-center text-gray-500 font-medium">{startIndex + idx + 1}</td>
@@ -9393,7 +9504,7 @@ const getLinkPreview = (url) => {
 };
 
 function MaterialsModule({ db, setDb, generateId, showToast, softDelete, user }) {
-  const defaultSession = user.role === 'tutor' ? user.teachingSession : SESSIONS[0];
+  const defaultSession = user.role === 'tutor' ? (parseSessions(user.teachingSession)[0] || SESSIONS[0]) : SESSIONS[0];
   const [formData, setFormData] = useState({ title: '', sessionGroup: defaultSession, link: '', notes: '' });
   const [isAdding, setIsAdding] = useState(false);
   const [isEditingId, setIsEditingId] = useState(null);
@@ -9416,8 +9527,8 @@ function MaterialsModule({ db, setDb, generateId, showToast, softDelete, user })
     if (!formData.link && !formData.notes) return showToast('Please provide either a link or an open-ended question', 'warning');
     
     // Enforce tutor restriction
-    if (user.role === 'tutor' && formData.sessionGroup !== user.teachingSession) {
-        return showToast('You can only manage materials for your assigned session.', 'error');
+    if (user.role === 'tutor' && !parseSessions(user.teachingSession).includes(formData.sessionGroup)) {
+        return showToast('You can only manage materials for your assigned sessions.', 'error');
     }
     
     if (isEditingId) {
@@ -9495,9 +9606,9 @@ function MaterialsModule({ db, setDb, generateId, showToast, softDelete, user })
      // Mencegah kasus di mana tutor tidak bisa lihat/kelola materi yang sudah terlihat siswa
      // akibat perbedaan minor pada sessionGroup (spasi, nama dari c.name vs SESSIONS[]).
      if (user.role !== 'admin') {
-       const _tSession = (user.teachingSession || '').toLowerCase();
+       const _tSessions = parseSessions(user.teachingSession).map(s => s.toLowerCase());
        const _mSession = (m.sessionGroup || '').toLowerCase();
-       const _sessionOk = _tSession && _mSession && (_tSession === _mSession || _tSession.includes(_mSession) || _mSession.includes(_tSession));
+       const _sessionOk = _tSessions.length > 0 && _mSession && _tSessions.some(ts => ts === _mSession || ts.includes(_mSession) || _mSession.includes(ts));
        if (!_sessionOk) return false;
      }
      
@@ -9534,11 +9645,10 @@ function MaterialsModule({ db, setDb, generateId, showToast, softDelete, user })
             <Input 
                label="Session Group" 
                type="select" 
-               options={user.role === 'tutor' ? [user.teachingSession] : SESSIONS} 
+               options={user.role === 'tutor' ? parseSessions(user.teachingSession) : SESSIONS} 
                value={formData.sessionGroup} 
                onChange={v => setFormData({...formData, sessionGroup: v})} 
                required 
-               disabled={user.role === 'tutor'}
             />
             <div className="md:col-span-2">
                <Input label="Link (YouTube / Website) - Optional" type="url" value={formData.link} onChange={v => setFormData({...formData, link: v})} placeholder="https://..." />
@@ -9569,10 +9679,12 @@ function MaterialsModule({ db, setDb, generateId, showToast, softDelete, user })
                className="w-full md:w-48 bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2 text-sm text-white focus:outline-none focus:border-[#00D4FF]" 
                value={filterSession} 
                onChange={(e) => setFilterSession(e.target.value)}
-               disabled={user.role === 'tutor'}
             >
                {user.role === 'tutor' ? (
-                 <option value={user.teachingSession}>{user.teachingSession}</option>
+                 <>
+                   <option value="">All My Sessions</option>
+                   {parseSessions(user.teachingSession).map(s => <option key={s} value={s}>{s}</option>)}
+                 </>
                ) : (
                  <>
                    <option value="">All Sessions</option>
@@ -9815,7 +9927,7 @@ function StudentMaterialsModule({ db, setDb, user, showToast, language = 'en' })
       </div>
 
       <div className="space-y-6">
-        {myMats.map(mat => {
+        {myMats.map((mat, matIdx) => {
           const preview = getLinkPreview(mat.link);
           const mySubIdx = (mat.submissions || []).findIndex(s => s.studentId === student?.id);
           const mySub = mySubIdx > -1 ? mat.submissions[mySubIdx] : null;
@@ -9865,7 +9977,10 @@ function StudentMaterialsModule({ db, setDb, user, showToast, language = 'en' })
                   
                   <div className="p-5 flex-1">
                      <div className="mb-4 border-b border-gray-800/50 pb-3">
-                        <h3 className="text-xl font-bold text-white mb-1 leading-tight">{mat.title}</h3>
+                        <div className="flex items-center gap-2 mb-1">
+                           <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-[#00D4FF]/10 border border-[#00D4FF]/20 text-[11px] font-black text-[#00D4FF] shrink-0">{String(matIdx + 1).padStart(2, '0')}</span>
+                           <h3 className="text-xl font-bold text-white leading-tight">{mat.title}</h3>
+                        </div>
                         <p className="text-xs text-gray-400">{language === 'id' ? 'Diposting pada' : 'Posted on'} {mat.date} {language === 'id' ? 'oleh' : 'by'} <span className="text-[#00D4FF]">{mat.tutorName}</span></p>
                      </div>
                      <p className="text-gray-300 text-sm whitespace-pre-wrap leading-relaxed">{mat.notes}</p>
