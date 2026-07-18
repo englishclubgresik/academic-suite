@@ -10,7 +10,6 @@ declare global {
     html2canvas?: (element: HTMLElement, options?: any) => Promise<HTMLCanvasElement>;
     XLSX?: any;
     ExcelJS?: any;
-    _syncBusyAttempt?: number;
   }
 }
 
@@ -103,6 +102,18 @@ const formatDropdownDate = (dateStr) => {
   const dateObj = new Date(y, m - 1, d);
   const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
   return `${days[dateObj.getDay()]}, ${parseInt(d, 10)} ${MONTHS[parseInt(m, 10)-1]} ${y}`;
+};
+
+// BUGFIX #7: Parse "YYYY-MM-DD" secara eksplisit menggunakan new Date(y, m-1, d)
+// untuk menghindari masalah UTC vs Local yang muncul saat pakai new Date("YYYY-MM-DD").
+// "YYYY-MM-DD" diparse sebagai UTC midnight oleh browser, sehingga di timezone
+// dengan offset negatif bisa muncul 1 hari lebih awal.
+const safeDateDisplay = (dateStr: string, locale: string, options: Intl.DateTimeFormatOptions) => {
+  if (!dateStr) return '';
+  const parts = dateStr.split('-');
+  if (parts.length !== 3) return dateStr;
+  const d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+  return d.toLocaleDateString(locale, options);
 };
 
 const calculateDaysLeft = (targetDate, todayDate) => {
@@ -201,9 +212,9 @@ const generateAutoComment = (student, attRate, avgScore, assessments) => {
   let highSubj = '';
   let lowSubj = '';
   if (latestAss && latestAss.scores) {
-       const scores = Object.entries(latestAss.scores).filter(([k]) => k !== 'material' && typeof latestAss.scores[k] === 'number');
+       const scores = Object.entries(latestAss.scores).filter(([k]) => k !== 'material' && latestAss.scores[k] !== '' && latestAss.scores[k] !== undefined && !isNaN(Number(latestAss.scores[k])));
        if(scores.length > 0) {
-           scores.sort((a,b) => (b[1] as number) - (a[1] as number));
+           scores.sort((a,b) => Number(b[1]) - Number(a[1]));
            highSubj = scores[0][0];
            lowSubj = scores[scores.length - 1][0];
        }
@@ -1046,7 +1057,8 @@ const StudentDashboard = ({ db, user, setActiveTab, today, isCloudConnected, lan
   }, []);
 
   const studentRecord = db.students.find(s => s.id === user.studentId) || { class: '-', level: '-', name: user.name };
-  const mySessionGroup = getSessionGroup(studentRecord.class);
+  // FIX: pakai getStudentSession() agar sessionOverride dihormati, bukan hanya class
+  const mySessionGroup = getStudentSession(studentRecord);
   const currentMonthPrefix = `${currentTime.getFullYear()}-${String(currentTime.getMonth() + 1).padStart(2, '0')}`;
   const currentMonthStr = String(currentTime.getMonth() + 1);
   const currentYearStr = String(currentTime.getFullYear());
@@ -1061,10 +1073,18 @@ const StudentDashboard = ({ db, user, setActiveTab, today, isCloudConnected, lan
      if (Number(b.year) !== Number(a.year)) return Number(b.year) - Number(a.year);
      return Number(b.month) - Number(a.month);
   });
-  const completedAssThisMonth = myAssessments.filter(a => a.month === currentMonthStr && a.year === currentYearStr).length;
+  const completedAssThisMonth = myAssessments.filter(a => Number(a.month) === Number(currentMonthStr) && String(a.year) === currentYearStr).length;
   const pendingAss = Math.max(0, 1 - completedAssThisMonth);
 
-  const journalEntriesThisMonth = db.journals.filter(j => j.sessionGroup === mySessionGroup && j.date.startsWith(currentMonthPrefix)).length;
+  // FIX #2: Gunakan fuzzy sessionMatches (konsisten dengan StudentReadOnlyJournalsModule)
+  // agar angka jurnal di dashboard tidak berbeda dari daftar di halaman My Journals.
+  const _sessionMatchesDash = (jGroup, sGroup) => {
+    if (!jGroup || !sGroup) return false;
+    if (jGroup === sGroup) return true;
+    const a = jGroup.toLowerCase(), b = sGroup.toLowerCase();
+    return a.includes(b) || b.includes(a);
+  };
+  const journalEntriesThisMonth = db.journals.filter(j => _sessionMatchesDash(j.sessionGroup, mySessionGroup) && j.date.startsWith(currentMonthPrefix)).length;
 
   const studentPlan = studentRecord.paymentPlan || 'Monthly';
   let paymentTarget = 0;
@@ -1074,7 +1094,7 @@ const StudentDashboard = ({ db, user, setActiveTab, today, isCloudConnected, lan
       paymentTarget = db.studentAttendance.filter(a => a.studentId === user.studentId && a.date.startsWith(currentMonthPrefix) && a.status === 'Present').length * 25000;
   }
   
-  const myPaymentsThisMonth = db.payments.filter(p => p.studentId === user.studentId && p.month === currentMonthStr && p.year === currentYearStr && p.status === 'Paid');
+  const myPaymentsThisMonth = db.payments.filter(p => p.studentId === user.studentId && Number(p.month) === Number(currentMonthStr) && String(p.year) === currentYearStr && p.status === 'Paid');
   const totalPaidAmount = myPaymentsThisMonth.reduce((sum, p) => sum + Number(p.amount), 0);
   
   let paymentStatusText = '';
@@ -1210,7 +1230,7 @@ const StudentDashboard = ({ db, user, setActiveTab, today, isCloudConnected, lan
                  <Card key={c.id} className="min-w-[280px] sm:min-w-[320px] bg-[#151B26] p-5 border border-gray-800 shadow-md hover:border-emerald-500/40 hover:shadow-[0_8px_30px_rgba(16,185,129,0.1)] transition-all snap-start">
                     <div className="flex justify-between items-start mb-4">
                         <div className="flex flex-col gap-1.5">
-                           <span className="px-3 py-1.5 text-xs font-bold bg-[#0B0F19] text-emerald-400 border border-emerald-500/20 rounded-lg tracking-wide">{new Date(c.date).toLocaleDateString(language === 'id' ? 'id-ID' : 'en-US', {weekday: 'short', month:'short', day:'numeric'})}</span>
+                           <span className="px-3 py-1.5 text-xs font-bold bg-[#0B0F19] text-emerald-400 border border-emerald-500/20 rounded-lg tracking-wide">{safeDateDisplay(c.date, language === 'id' ? 'id-ID' : 'en-US', {weekday: 'short', month:'short', day:'numeric'})}</span>
                            <span className="text-[11px] font-semibold text-amber-400 uppercase tracking-widest">{calculateDaysLeft(c.date, today)}</span>
                         </div>
                         <span className="text-xs font-semibold text-gray-400 bg-gray-800/50 px-2.5 py-1.5 rounded-lg flex items-center gap-1.5"><Clock size={12}/> {c.startTime}</span>
@@ -1289,10 +1309,10 @@ const AdminDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
   const currentYear = String(dObj.getFullYear());
   
   const currentJournals = db.journals.filter(j => j.date.startsWith(`${currentYear}-${currentMonth.padStart(2, '0')}`)).length;
-  const paidPayrollCount = db.payroll.filter(p => p.month === currentMonth && p.year === currentYear && p.status === 'Paid').length;
+  const paidPayrollCount = db.payroll.filter(p => Number(p.month) === Number(currentMonth) && String(p.year) === String(currentYear) && p.status === 'Paid').length;
 
   const activeStudentIds = db.students.filter(s => s.status === 'Active' || s.active === 'Active').map(s => s.id);
-  const currentMonthPayments = db.payments.filter(p => p.month === currentMonth && p.year === currentYear && activeStudentIds.includes(p.studentId));
+  const currentMonthPayments = db.payments.filter(p => Number(p.month) === Number(currentMonth) && String(p.year) === String(currentYear) && activeStudentIds.includes(p.studentId));
   const totalRevenueAmount = currentMonthPayments.filter(p => p.status === 'Paid').reduce((sum, p) => sum + Number(p.amount), 0);
   const paidInvoicesCount = currentMonthPayments.filter(p => p.status === 'Paid').length;
 
@@ -1303,16 +1323,10 @@ const AdminDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
   const activeStudents = db.students.filter(s => s.status === 'Active' || s.active === 'Active');
   
   activeStudents.forEach(s => {
-     const plan = s.paymentPlan || 'Monthly';
      const sGroup = getStudentSession(s);
-     let studentTarget = 0;
-     if (plan === 'Monthly') {
-         const scheduledCount = db.calendar.filter(c => c.date.startsWith(currentMonthPrefix) && (c.sessionGroup || c.name) === sGroup).length;
-         studentTarget = scheduledCount * 25000;
-     } else {
-         const presentCount = db.studentAttendance.filter(a => a.studentId === s.id && a.date.startsWith(currentMonthPrefix) && a.status === 'Present').length;
-         studentTarget = presentCount * 25000;
-     }
+     // Semua siswa (Monthly maupun Per Visit) dihitung berdasarkan jumlah jadwal bulan ini
+     const scheduledCount = db.calendar.filter(c => c.date.startsWith(currentMonthPrefix) && (c.sessionGroup || c.name) === sGroup).length;
+     const studentTarget = scheduledCount * 25000;
      expectedRevenueAmount += studentTarget;
 
      const studentPaid = currentMonthPayments.filter(p => p.studentId === s.id && p.status === 'Paid').reduce((sum, p) => sum + Number(p.amount), 0);
@@ -1449,7 +1463,7 @@ const AdminDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                         <p className="font-bold text-white text-sm sm:text-base truncate">{c.sessionGroup || c.name}</p>
                         <p className="text-xs text-blue-400 font-medium truncate mt-0.5">{c.tutor}</p>
                         <div className="flex items-center flex-wrap gap-2 mt-1.5 text-xs">
-                           <span className="text-emerald-400 font-medium whitespace-nowrap">{new Date(c.date).toLocaleDateString(language === 'id' ? 'id-ID' : 'en-US', {weekday: 'short'})}, {c.date}</span>
+                           <span className="text-emerald-400 font-medium whitespace-nowrap">{safeDateDisplay(c.date, language === 'id' ? 'id-ID' : 'en-US', {weekday: 'short'})}, {c.date}</span>
                            <span className="text-gray-500 hidden sm:inline whitespace-nowrap">{c.startTime} - {c.endTime}</span>
                            <span className="text-amber-400 font-bold bg-amber-400/10 px-2 py-0.5 rounded ml-auto">{calculateDaysLeft(c.date, today)}</span>
                         </div>
@@ -1572,7 +1586,12 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
   // Helper for Co-Teaching: Memisahkan string "Tutor A & Tutor B" untuk mencocokkan nama
   const isMyClass = (tutorString, myName) => tutorString && tutorString.split(' & ').includes(myName);
 
-  const myClassesToday = db.calendar.filter(c => c.date === today && isMyClass(c.tutor, user.name));
+  // Fix #11: kecualikan event yang dibatalkan/libur dari hitungan kelas hari ini
+  // agar badge "Jurnal Tertunda" tidak muncul untuk kelas yang tidak jadi berlangsung.
+  const CANCELLED_TYPES = ['Cancelled', 'Holiday', 'Off Day', 'Libur', 'Dibatalkan'];
+  const myClassesToday = db.calendar.filter(
+    c => c.date === today && isMyClass(c.tutor, user.name) && !CANCELLED_TYPES.includes(c.type)
+  );
   const todayClassesCount = myClassesToday.length;
 
   const myUpcomingClasses = db.calendar
@@ -1580,7 +1599,10 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
       .sort((a,b) => String(a.date || '').localeCompare(String(b.date || '')))
       .slice(0, 5);
 
-  const hasCheckedIn = db.tutorAttendance.some(a => a.tutorId === user.id && a.date === today && a.status === 'Present');
+  // Fix #4: fallback ke name untuk data legacy yang belum punya tutorId
+  const hasCheckedIn = db.tutorAttendance.some(
+    a => (a.tutorId === user.id || (!a.tutorId && a.name === user.name)) && a.date === today && a.status === 'Present'
+  );
   const checkInText = hasCheckedIn ? (language === 'id' ? 'Hadir' : 'Present') : (language === 'id' ? 'Belum Absen' : 'Not Checked In');
 
   const journalsToday = db.journals.filter(j => j.tutorName === user.name && j.date === today).length;
@@ -1591,7 +1613,7 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
   const attPresent = attThisMonth.filter(a => a.status === 'Present').length;
   const attendanceRate = attThisMonth.length > 0 ? Math.round((attPresent / attThisMonth.length) * 100) : 0;
 
-  const assessmentsDone = db.assessments.filter(a => a.month === currentMonth && a.year === currentYear && a.sessionGroup === mySession).length;
+  const assessmentsDone = db.assessments.filter(a => Number(a.month) === Number(currentMonth) && String(a.year) === String(currentYear) && a.sessionGroup === mySession).length;
   const assessmentsPending = Math.max(0, myStudents - assessmentsDone);
 
   const classesCompletedMonth = db.calendar.filter(c => isMyClass(c.tutor, user.name) && c.date.startsWith(monthPrefix) && c.date <= today).length;
@@ -1601,8 +1623,13 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
   // PERBAIKAN: Hanya tampilkan progress bar untuk kelas yang diajarkan oleh tutor ini saja
   const classProgressData = [mySession].map(session => {
      const studentsInSess = db.students.filter(s => s.status === 'Active' && getStudentSession(s) === session).length;
-     const assessed = db.assessments.filter(a => a.sessionGroup === session && a.month === currentMonth && a.year === currentYear).length;
-     const pct = studentsInSess > 0 ? Math.round((assessed / studentsInSess) * 100) : 0;
+     // Fix #10: hitung unique studentId saja (cegah duplicate assessment inflating progress > 100%)
+     const uniqueAssessed = new Set(
+       db.assessments
+         .filter(a => a.sessionGroup === session && Number(a.month) === Number(currentMonth) && String(a.year) === String(currentYear))
+         .map(a => a.studentId)
+     ).size;
+     const pct = studentsInSess > 0 ? Math.min(100, Math.round((uniqueAssessed / studentsInSess) * 100)) : 0;
      return { session, pct };
   });
 
@@ -1641,7 +1668,7 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                         <div className="flex items-center flex-wrap gap-2 mt-1 sm:mt-1.5 text-xs">
                            <span className="text-[#00D4FF] font-medium whitespace-nowrap">
                              <CalendarIcon size={12} className="inline mr-1" />
-                             {new Date(c.date).toLocaleDateString(language === 'id' ? 'id-ID' : 'en-US', {weekday: 'short'})}, {c.date}
+                             {safeDateDisplay(c.date, language === 'id' ? 'id-ID' : 'en-US', {weekday: 'short'})}, {c.date}
                            </span>
                            <span className="text-gray-400 font-medium whitespace-nowrap"><Clock size={12} className="inline mr-1" />{c.startTime} - {c.endTime}</span>
                            <span className="text-amber-400 font-bold bg-amber-400/10 px-2 py-0.5 rounded ml-auto">{calculateDaysLeft(c.date, today)}</span>
@@ -1880,20 +1907,29 @@ const normalizeData = (data) => {
    });
 
    // --- PATCH BUG: FIX TANGGAL & WAKTU ANEH DARI GOOGLE SHEETS (LMT BATAVIA BUG) ---
+   // BUGFIX #1 & #5: Gunakan metode UTC (getUTCHours, getUTCFullYear, dst.)
+   // agar tidak terjadi pergeseran jam/tanggal akibat konversi timezone browser.
+   // Google Sheets menyimpan time/date sebagai UTC — membacanya dengan getHours()
+   // (local time) menyebabkan geser ±7 jam di WIB.
    const fixTime = (t) => {
       if (typeof t === 'string' && t.includes('T') && t.includes('Z')) {
          const d = new Date(t);
          if (!isNaN(d.getTime())) {
-            let m = d.getMinutes();
-            let s = d.getSeconds();
+            let hours = d.getUTCHours();
+            let minutes = d.getUTCMinutes();
+            let seconds = d.getUTCSeconds();
             // Kompensasi bug zona waktu Batavia (LMT +07:07:12) sebelum tahun 1900
-            if (d.getFullYear() <= 1901 && (s !== 0 || m % 5 !== 0)) {
-                d.setSeconds(d.getSeconds() + 432); // Tambah 7 menit 12 detik
+            if (d.getUTCFullYear() <= 1901 && (seconds !== 0 || minutes % 5 !== 0)) {
+               minutes += 7;
+               seconds += 12;
+               if (seconds >= 60) { seconds -= 60; minutes += 1; }
+               if (minutes >= 60) { minutes -= 60; hours += 1; }
             }
             // Pembulatan ke 5 menit terdekat untuk membersihkan sisa angka aneh
-            d.setMinutes(Math.round(d.getMinutes() / 5) * 5);
-            d.setSeconds(0);
-            return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+            minutes = Math.round(minutes / 5) * 5;
+            if (minutes >= 60) { minutes = 0; hours += 1; }
+            hours = hours % 24;
+            return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
          }
       }
       return t;
@@ -1903,7 +1939,8 @@ const normalizeData = (data) => {
       if (typeof dStr === 'string' && dStr.includes('T') && dStr.includes('Z')) {
          const d = new Date(dStr);
          if (!isNaN(d.getTime())) {
-            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            // BUGFIX #5: Gunakan getUTC* agar tanggal tidak geser 1 hari
+            return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
          }
       }
       return dStr;
@@ -1913,7 +1950,7 @@ const normalizeData = (data) => {
       if (typeof dStr === 'string' && dStr.includes('T') && dStr.includes('Z')) {
          const d = new Date(dStr);
          if (!isNaN(d.getTime())) {
-            return d.toLocaleString('en-GB', { dateStyle: 'short', timeStyle: 'short' });
+            const _l=d; return `${String(_l.getDate()).padStart(2,'0')}/${String(_l.getMonth()+1).padStart(2,'0')}/${_l.getFullYear()}, ${String(_l.getHours()).padStart(2,'0')}:${String(_l.getMinutes()).padStart(2,'0')}`;
          }
       }
       return dStr;
@@ -1939,14 +1976,20 @@ const normalizeData = (data) => {
    });
 
    // Bersihkan juga tanggal bergabung (joinedDate) siswa & tutor dari format ISO/UTC mentah
-   ['students', 'tutors'].forEach(collection => {
-      if (norm[collection] && Array.isArray(norm[collection])) {
-         norm[collection] = norm[collection].map(item => ({
-            ...item,
-            joinedDate: item.joinedDate ? fixDate(item.joinedDate) : item.joinedDate
-         }));
-      }
-   });
+   if (norm.students && Array.isArray(norm.students)) {
+      norm.students = norm.students.map(item => ({
+         ...item,
+         joinedDate: item.joinedDate ? fixDate(item.joinedDate) : item.joinedDate,
+         whatsapp: item.whatsapp ? normalizeWhatsapp(item.whatsapp) : item.whatsapp
+      }));
+   }
+   if (norm.tutors && Array.isArray(norm.tutors)) {
+      norm.tutors = norm.tutors.map(item => ({
+         ...item,
+         joinedDate: item.joinedDate ? fixDate(item.joinedDate) : item.joinedDate,
+         phone: item.phone ? normalizeWhatsapp(item.phone) : item.phone
+      }));
+   }
 
    // Bersihkan tanggal/waktu bersarang pada tugas (materials): submission siswa & balasan diskusi
    if (norm.materials && Array.isArray(norm.materials)) {
@@ -2168,6 +2211,9 @@ function MainApp() {
   const toastTimeoutRef = useRef(null);
   // NEW: Ref untuk debounce sync ke cloud (mencegah race condition saat input beruntun)
   const syncDebounceTimer = useRef(null);
+  // BUGFIX #6: Ganti window._syncBusyAttempt (global, race condition multi-tab)
+  // dengan useRef yang scoped ke instance komponen ini saja.
+  const syncBusyAttempt = useRef(0);
   // NEW: Ref untuk mencegah infinite loop saat proses exit browser
   const isExiting = useRef(false);
 
@@ -2526,7 +2572,12 @@ function MainApp() {
              // PERBAIKAN KRITIS: Mencegah Race Condition (Data Hilang Saat Log In Kembali)
              // Guard ini hanya aktif jika user SUDAH login dan mengedit data di sesi ini.
              // Jika belum login (startup / perangkat baru), SELALU pakai data cloud.
-             const getCount = (d) => (d.users?.length||0) + (d.students?.length||0) + (d.tutors?.length||0) + (d.studentAttendance?.length||0) + (d.journals?.length||0);
+             // BUGFIX #2: Hitung SEMUA koleksi (bukan hanya 5) agar data baru di
+             // calendar/assessments/payments/materials/announcements dari perangkat
+             // lain tidak terlewat oleh guard ini.
+             const getCount = (d) => Object.keys(defaultDbStructure)
+               .filter(k => k !== 'recycleBin')
+               .reduce((sum, k) => sum + (Array.isArray(d[k]) ? d[k].length : 0), 0);
              const localCount = getCount(prevDb);
              const cloudCount = getCount(cloudDb);
              const userIsLoggedIn = !!getAuthToken();
@@ -2640,6 +2691,10 @@ function MainApp() {
            if (data.status === 'success') {
                // Perbarui versi lokal dengan versi terbaru dari server jika ada
                if (data.newVersion) dbVersion.current = data.newVersion;
+               // BUGFIX #3: Reset dirty flag setelah sync berhasil agar guard merge
+               // tidak terus memblokir data cloud di sesi yang sama.
+               isDbDirty.current = false;
+               syncBusyAttempt.current = 0;
                setIsCloudConnected(true);
                setSyncStatus('saved'); // SET INDIKATOR BERHASIL
            } else if (data.status === 'conflict') {
@@ -2662,10 +2717,11 @@ function MainApp() {
                        const merged = normalizeData(freshData.payload);
                        if (freshData._dbVersion) dbVersion.current = freshData._dbVersion;
                        skipCloudSave.current = true;
+                       // BUGFIX #4: Reset isDbDirty SEBELUM setDb agar useEffect db tidak
+                       // langsung mengirim ulang data lokal lama ke cloud (infinite overwrite loop).
+                       isDbDirty.current = false;
                        setDb(merged);
-                       // Setelah state diperbarui dengan data server, isDbDirty tetap true
-                       // sehingga useEffect db akan memicu sync ulang dengan baseVersion yang benar.
-                       setSyncStatus('syncing');
+                       setSyncStatus('saved');
                        setIsCloudConnected(true);
                      } else {
                        setSyncStatus('error');
@@ -2678,13 +2734,15 @@ function MainApp() {
            } else if (data.status === 'busy') {
                // FIX 5: Busy — auto-retry dengan exponential backoff (2s, 4s, 8s).
                // Tanpa ini, data tidak pernah tersinkron jika user tidak edit apapun lagi.
-               const attempt = (window._syncBusyAttempt || 0) + 1;
-               window._syncBusyAttempt = attempt;
+               // BUGFIX #6: Gunakan syncBusyAttempt ref (bukan window._syncBusyAttempt)
+               // agar tidak terjadi race condition jika app dibuka di 2 tab sekaligus.
+               syncBusyAttempt.current = syncBusyAttempt.current + 1;
+               const attempt = syncBusyAttempt.current;
                const delay = Math.min(2000 * Math.pow(2, attempt - 1), 16000); // 2s, 4s, 8s, max 16s
                console.warn(`AppScript busy — retry #${attempt} dalam ${delay/1000}s`);
                setSyncStatus('syncing');
                setTimeout(() => {
-                 window._syncBusyAttempt = 0; // reset counter setelah retry terakhir
+                 syncBusyAttempt.current = 0; // reset counter setelah retry
                  isDbDirty.current = true;    // paksa useEffect db untuk trigger sync ulang
                  setDb(prev => ({ ...prev })); // trigger useEffect dengan shallow copy
                }, delay);
@@ -2829,7 +2887,10 @@ function MainApp() {
              if (cloudDb && Array.isArray(cloudDb.users)) {
                 if (data._dbVersion) dbVersion.current = data._dbVersion;
                 setDb(prevDb => {
-                   const getCount = (d) => (d.users?.length||0) + (d.students?.length||0) + (d.tutors?.length||0) + (d.studentAttendance?.length||0) + (d.journals?.length||0);
+                   // BUGFIX #2: Hitung semua koleksi untuk perbandingan yang akurat
+                   const getCount = (d) => Object.keys(defaultDbStructure)
+                     .filter(k => k !== 'recycleBin')
+                     .reduce((sum, k) => sum + (Array.isArray(d[k]) ? d[k].length : 0), 0);
                    const localCount = getCount(prevDb);
                    const cloudCount = getCount(cloudDb);
                    
@@ -3067,10 +3128,17 @@ function MainApp() {
 
     if (currentUser?.role === 'tutor') {
       const isMyClass = (tutorString, myName) => tutorString && tutorString.split(' & ').includes(myName);
-      const mySchedulesToday = db.calendar.filter(c => c.date === today && isMyClass(c.tutor, currentUser.name));
+      // Fix #11: kecualikan event dibatalkan dari hitungan badge notifikasi
+      const CANCELLED_TYPES_BADGE = ['Cancelled', 'Holiday', 'Off Day', 'Libur', 'Dibatalkan'];
+      const mySchedulesToday = db.calendar.filter(
+        c => c.date === today && isMyClass(c.tutor, currentUser.name) && !CANCELLED_TYPES_BADGE.includes(c.type)
+      );
       
       // 1. Tutor Check-In (Jika ada jadwal kelas hari ini tapi belum check-in)
-      const hasCheckedIn = db.tutorAttendance.some(a => a.tutorId === currentUser.id && a.date === today && a.status === 'Present');
+      // Fix #4: fallback ke name untuk data legacy yang belum punya tutorId
+      const hasCheckedIn = db.tutorAttendance.some(
+        a => (a.tutorId === currentUser.id || (!a.tutorId && a.name === currentUser.name)) && a.date === today && a.status === 'Present'
+      );
       counts.tutor_attendance = (!hasCheckedIn && mySchedulesToday.length > 0) ? 1 : 0;
       
       // 2. Learning Journals (Kurangi jumlah jadwal dengan jumlah jurnal hari ini)
@@ -3085,7 +3153,7 @@ function MainApp() {
       const activeStudents = db.students.filter(s => s.status === 'Active');
       const mySession = currentUser.teachingSession;
       const myStudents = activeStudents.filter(s => getStudentSession(s) === mySession).length;
-      const assessmentsDone = db.assessments.filter(a => a.month === currentMonth && a.year === currentYear && a.sessionGroup === mySession).length;
+      const assessmentsDone = db.assessments.filter(a => Number(a.month) === Number(currentMonth) && String(a.year) === String(currentYear) && a.sessionGroup === mySession).length;
       counts.assessments = Math.max(0, myStudents - assessmentsDone);
       
       // 5. Materials & Tasks (Menghitung submission / komentar siswa yang belum ditandai checked/read)
@@ -3108,12 +3176,19 @@ function MainApp() {
       } else {
           target = db.studentAttendance.filter(a => a.studentId === currentUser.studentId && a.date.startsWith(monthPrefix) && a.status === 'Present').length * 25000;
       }
-      const totalPaid = db.payments.filter(p => p.studentId === currentUser.studentId && p.month === currentMonth && p.year === currentYear && p.status === 'Paid').reduce((sum, p) => sum + Number(p.amount), 0);
+      const totalPaid = db.payments.filter(p => p.studentId === currentUser.studentId && Number(p.month) === Number(currentMonth) && String(p.year) === String(currentYear) && p.status === 'Paid').reduce((sum, p) => sum + Number(p.amount), 0);
       
       counts.my_payments = (totalPaid < target && target > 0) ? 1 : 0;
 
       // 2. My Materials: Jumlah SEMUA tugas/materi yang belum dikerjakan (submit) oleh siswa (tidak terbatas bulan ini saja)
-      const allMyMats = (db.materials || []).filter(m => m.sessionGroup === mySession);
+      // FIX #3: Gunakan fuzzy match agar konsisten dengan tampilan di StudentMaterialsModule
+      const _sessionMatchesBadge = (mGroup, sGroup) => {
+        if (!mGroup || !sGroup) return false;
+        if (mGroup === sGroup) return true;
+        const a = mGroup.toLowerCase(), b = sGroup.toLowerCase();
+        return a.includes(b) || b.includes(a);
+      };
+      const allMyMats = (db.materials || []).filter(m => _sessionMatchesBadge(m.sessionGroup, mySession));
       const pendingMats = allMyMats.filter(m => {
          const mySub = (m.submissions || []).find(s => s.studentId === currentUser.studentId);
          return !mySub; // Belum ada pengumpulan tugas
@@ -3184,7 +3259,7 @@ function MainApp() {
       case 'student_attendance':
         return <StudentAttendanceModule db={db} setDb={setDb} showToast={showToast} softDelete={softDelete} user={currentUser} generateId={generateId} />;
       case 'tutor_attendance':
-        return <TutorAttendanceModule db={db} setDb={setDb} user={currentUser} showToast={showToast} softDelete={softDelete} />;
+        return <TutorAttendanceModule db={db} setDb={setDb} user={currentUser} showToast={showToast} softDelete={softDelete} generateId={generateId} />;
       case 'my_attendance': // STUDENT: Read Only Attendance
         return <StudentReadOnlyAttendanceModule db={db} user={currentUser} language={language} />;
       case 'journals':
@@ -3765,6 +3840,14 @@ function StudentAttendanceModule({ db, setDb, showToast, softDelete, user, gener
 
   const handleSave = () => {
     if (Object.keys(attendanceData).length === 0 || !selectedSchedule) return;
+    // Fix #7: cegah pengisian absensi retroaktif — hanya izinkan pada hari jadwal berlangsung.
+    // Admin dikecualikan agar tetap bisa koreksi data historis.
+    const schedDate = selectedSchedule.date;
+    const todayLocal = getTodayDateLocal();
+    if (user.role === 'tutor' && schedDate !== todayLocal) {
+      showToast('Attendance can only be submitted on the scheduled class date', 'warning');
+      return;
+    }
     const sGroup = selectedSchedule.sessionGroup || selectedSchedule.name;
     const newRecords = Object.entries(attendanceData).map(([studentId, status]) => {
       const student = activeStudents.find((s) => s.id === studentId);
@@ -3797,10 +3880,12 @@ function StudentAttendanceModule({ db, setDb, showToast, softDelete, user, gener
     } else {
         records = records.filter((a) => a.date === viewDate);
         if (user && user.role === 'tutor') {
+          // Fix #5: hanya tampilkan record dari jadwal yang memang milik tutor ini.
+          // Hapus fallback "a.sessionGroup === user.teachingSession" karena bisa bocorkan
+          // data absensi sesi lain ke tutor yang kebetulan mengajar sesi yang sama.
           records = records.filter(a => {
               const sched = db.calendar.find(c => c.id === a.scheduleId);
-              if (sched && sched.tutor && sched.tutor.split(' & ').includes(user.name)) return true;
-              return a.sessionGroup === user.teachingSession;
+              return sched && sched.tutor && sched.tutor.split(' & ').includes(user.name);
           });
         }
     }
@@ -3820,7 +3905,7 @@ function StudentAttendanceModule({ db, setDb, showToast, softDelete, user, gener
     const [y, m] = String(dateStr).split('-');
     const monthPrefix = `${y}-${m}`;
     const sPaid = db.payments
-      .filter((p) => p.studentId === studentId && p.month === String(Number(m)) && p.year === String(y) && p.status === 'Paid')
+      .filter((p) => p.studentId === studentId && Number(p.month) === Number(m) && String(p.year) === String(y) && p.status === 'Paid')
       .reduce((sum, p) => sum + Number(p.amount), 0);
     const sTarget = db.studentAttendance.filter((a) => a.studentId === studentId && a.date.startsWith(monthPrefix) && a.status === 'Present').length * 25000;
     return sPaid - sTarget < 0;
@@ -3954,7 +4039,7 @@ function StudentAttendanceModule({ db, setDb, showToast, softDelete, user, gener
   );
 }
 
-function TutorAttendanceModule({ db, setDb, user, showToast, softDelete }) {
+function TutorAttendanceModule({ db, setDb, user, showToast, softDelete, generateId }) {
   const [editingId, setEditingId] = useState(null);
   const [editStatus, setEditStatus] = useState('');
 
@@ -3979,19 +4064,38 @@ function TutorAttendanceModule({ db, setDb, user, showToast, softDelete }) {
     if (existingRecords.find((a) => a.tutorId === user.id && a.date === today)) {
        return showToast('Already checked in today', 'warning');
     }
+    // Fix #2: only allow check-in when there is a scheduled class today
+    const hasScheduleToday = (db.calendar || []).some(c => c.date === today && c.tutor && c.tutor.split(' & ').includes(user.name));
+    if (!hasScheduleToday) {
+       return showToast('No scheduled class today — check-in not allowed', 'warning');
+    }
     
     setDb((prev) => ({ 
       ...prev, 
       tutorAttendance: [
         ...(prev.tutorAttendance || []), 
-        { id: `TA-${Date.now()}`, tutorId: user.id, name: user.name, date: today, day, time, status: 'Present' }
+        { id: generateId ? generateId('TA', 'tutorAttendance') : `TA-${Date.now()}-${Math.random().toString(36).slice(2,6).toUpperCase()}`, tutorId: user.id, name: user.name, date: today, day, time, status: 'Present' }
       ] 
     }));
     showToast('Checked in successfully');
   };
 
   const saveEdit = (id) => {
-    setDb((p) => ({ ...p, tutorAttendance: p.tutorAttendance.map((a) => a.id === id ? { ...a, status: editStatus } : a) }));
+    setDb((p) => ({
+      ...p,
+      tutorAttendance: p.tutorAttendance.map((a) =>
+        a.id === id
+          ? {
+              ...a,
+              status: editStatus,
+              // Fix #3: audit trail — record who changed the status and when
+              lastEditedBy: user.name,
+              lastEditedAt: new Date().toISOString(),
+              originalStatus: a.originalStatus || a.status,
+            }
+          : a
+      ),
+    }));
     setEditingId(null);
     showToast('Updated');
   };
@@ -4156,6 +4260,17 @@ function AssessmentsModule({ db, setDb, generateId, showToast, user }) {
   };
 
   const handleSaveAll = () => {
+    // Fix #8: lock periode — tutor tidak boleh mengubah nilai bulan yang sudah lewat.
+    // Admin tetap bisa edit kapan saja untuk keperluan koreksi.
+    if (user?.role === 'tutor') {
+      const now = new Date();
+      const currentMonth = now.getMonth() + 1;
+      const currentYear = now.getFullYear();
+      if (Number(year) < currentYear || (Number(year) === currentYear && Number(month) < currentMonth)) {
+        showToast('Cannot edit assessments for past months', 'warning');
+        return;
+      }
+    }
     let newAssessments = [...db.assessments];
     let updatedCount = 0;
 
@@ -4434,7 +4549,8 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
               <div className="flex justify-between items-center border-b border-slate-100 py-3 px-2">
                 <span className="font-medium text-slate-600">Date & Time</span>
                 <span className="font-semibold text-slate-800">
-                  {new Date(selectedInvoice.date).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })} {selectedInvoice.time ? `• ${selectedInvoice.time}` : ''}
+                  {/* FIX #5: safeDateDisplay agar konsisten dan bebas UTC-shift */}
+                  {safeDateDisplay(selectedInvoice.date, 'en-US', { month: 'long', day: 'numeric', year: 'numeric' })} {selectedInvoice.time ? `• ${selectedInvoice.time}` : ''}
                 </span>
               </div>
               <div className="flex justify-between items-center border-b border-slate-100 py-3 px-2">
@@ -4940,7 +5056,12 @@ function HistoryReportsModule({ db, setDb, showToast, handlePrint, user }) {
       : ['Speaking', 'Writing', 'Reading', 'Listening'];
 
     const isKindergarten = student.level === 'Kindergarten' || ['PAUD', 'TK A', 'TK B'].includes(student.class);
-    const latestAss = assessments.length > 0 ? assessments[0] : null;
+    // Fix #9: sort descending by year+month agar [0] selalu merupakan record terbaru
+    const sortedAssessments = [...assessments].sort((a, b) => {
+      if (Number(b.year) !== Number(a.year)) return Number(b.year) - Number(a.year);
+      return Number(b.month) - Number(a.month);
+    });
+    const latestAss = sortedAssessments.length > 0 ? sortedAssessments[0] : null;
     const scores = latestAss && latestAss.scores ? latestAss.scores : {};
     const getScore = (subject) => Number(scores[subject]) || 0;
 
@@ -5086,7 +5207,8 @@ function HistoryReportsModule({ db, setDb, showToast, handlePrint, user }) {
                     {assessments.length > 0 && (
                        <div className="bg-[#F8FAFC] border border-slate-100 rounded-lg p-1.5 flex items-center justify-between h-[30px]">
                           <span className="text-[11px] text-slate-500 font-medium uppercase tracking-wide">Final Grade</span>
-                          <span className="font-black text-base text-blue-600 leading-none">{assessments[0]?.grade || '—'}</span>
+                          {/* Fix #9: pakai sortedAssessments[0] — sudah diurutkan terbaru */}
+                          <span className="font-black text-base text-blue-600 leading-none">{sortedAssessments[0]?.grade || '—'}</span>
                        </div>
                     )}
                  </div>
@@ -6217,7 +6339,7 @@ function CalendarModule({ db, setDb, generateId, user, showToast, softDelete }) 
                           <span className={`px-2 py-0.5 text-[11px] uppercase font-bold rounded ${c.type === 'Holiday' ? 'bg-red-500/20 text-red-400' : c.type === 'Exam' ? 'bg-purple-500/20 text-purple-400' : 'bg-blue-500/20 text-blue-400'}`}>{c.type}</span>
                        </div>
                        <p className="text-gray-400 text-sm flex flex-wrap gap-3">
-                          <span className="whitespace-nowrap"><CalendarIcon size={14} className="inline mr-1"/> {new Date(c.date).toLocaleDateString('en-GB', {weekday: 'short', day: 'numeric', month: 'short'})}</span>
+                          <span className="whitespace-nowrap"><CalendarIcon size={14} className="inline mr-1"/> {safeDateDisplay(c.date, 'en-GB', {weekday: 'short', day: 'numeric', month: 'short'})}</span>
                           <span className="whitespace-nowrap"><Clock size={14} className="inline mr-1"/> {c.startTime} - {c.endTime}</span>
                           <span className="whitespace-nowrap"><User size={14} className="inline mr-1"/> {c.tutor}</span>
                        </p>
@@ -6887,7 +7009,10 @@ function AccountSettingsModule({ db, setDb, user, setCurrentUser, showToast, lan
     e.preventDefault();
 
     const currentNumStr = (!isNaN(Number(currentPwd)) && currentPwd !== '') ? String(Number(currentPwd)) : null;
-    if (user.password && String(currentPwd) !== String(user.password) && (!currentNumStr || String(user.password) !== currentNumStr)) {
+    // FIX #1: Jika GAS mengirim '__MASKED__' sebagai sentinel (password di-mask server),
+    // lewati pengecekan password lama agar siswa/tutor tetap bisa ganti password.
+    const isMaskedPassword = !user.password || user.password === '__MASKED__';
+    if (!isMaskedPassword && String(currentPwd) !== String(user.password) && (!currentNumStr || String(user.password) !== currentNumStr)) {
       return showToast('Your current password is incorrect.', 'error');
     }
     if (newPwd !== confirmPwd) {
@@ -6911,30 +7036,10 @@ function AccountSettingsModule({ db, setDb, user, setCurrentUser, showToast, lan
 
     setCurrentUser({ ...user, password: newPwd });
 
-    // Force-push langsung ke cloud agar password baru langsung tercatat di relational sheet
-    setTimeout(() => {
-      const token = sessionStorage.getItem('ecg_session_token');
-      if (token) {
-        const updatedTutors = user.role === 'tutor'
-          ? db.tutors.map(t => t.username === user.username ? { ...t, password: newPwd } : t)
-          : db.tutors;
-        const updatedUsers = user.role !== 'tutor'
-          ? db.users.map(u => u.username === user.username ? { ...u, password: newPwd } : u)
-          : db.users;
-        fetch(APPSCRIPT_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          redirect: 'follow',
-          body: JSON.stringify({
-            action: 'sync',
-            token,
-            baseVersion: '',
-            user: user.name,
-            payload: { ...db, users: updatedUsers, tutors: updatedTutors }
-          })
-        }).catch(() => {});
-      }
-    }, 300);
+    // FIX #6: Force-push manual dihapus karena menggunakan snapshot db (stale closure)
+    // yang bisa menimpa data terbaru dari perangkat lain.
+    // Auto-sync useEffect akan mendeteksi perubahan setDb di atas dan menyinkronkan
+    // ke GAS dalam ~2 detik secara aman dengan state React terbaru.
 
     showToast('Your password has been successfully updated.', 'success');
     setCurrentPwd(''); setNewPwd(''); setConfirmPwd('');
@@ -6986,7 +7091,8 @@ function AccountSettingsModule({ db, setDb, user, setCurrentUser, showToast, lan
                  {profileDetails.whatsapp && (
                    <div>
                       <p className="text-xs text-gray-500 uppercase tracking-widest font-bold mb-1">WhatsApp</p>
-                      <p className="text-white font-medium bg-[#0B0F19] px-4 py-2.5 rounded-lg border border-gray-800">{String(profileDetails.whatsapp).replace(/^'/, '')}</p>
+                      {/* FIX #7: Konversi balik 628xxx → 08xxx untuk tampilan agar sesuai ekspektasi siswa */}
+                      <p className="text-white font-medium bg-[#0B0F19] px-4 py-2.5 rounded-lg border border-gray-800">{(() => { const d = String(profileDetails.whatsapp || '').replace(/^'/, ''); return d.startsWith('628') ? '0' + d.slice(2) : d; })()}</p>
                    </div>
                  )}
                </>
@@ -7002,7 +7108,8 @@ function AccountSettingsModule({ db, setDb, user, setCurrentUser, showToast, lan
                    <div>
                       <p className="text-xs text-gray-500 uppercase tracking-widest font-bold mb-1">WhatsApp</p>
                       <a href={`https://wa.me/${normalizeWhatsapp(profileDetails.phone)}`} target="_blank" rel="noopener noreferrer" className="text-white font-medium bg-[#0B0F19] px-4 py-2.5 rounded-lg border border-gray-800 flex items-center justify-between gap-2 hover:border-green-500/50 transition-colors">
-                        <span>{String(profileDetails.phone).replace(/^'/, '')}</span>
+                        {/* FIX #7: Konversi balik 628xxx → 08xxx untuk tampilan */}
+                        <span>{(() => { const d = String(profileDetails.phone || '').replace(/^'/, ''); return d.startsWith('628') ? '0' + d.slice(2) : d; })()}</span>
                         <MessageCircle size={16} className="text-green-400" />
                       </a>
                    </div>
@@ -7288,7 +7395,8 @@ function StudentReadOnlyPaymentModule({ db, user, downloadPNG, handleShareImage,
               <div className="flex justify-between items-center border-b border-slate-100 py-3 px-2">
                 <span className="font-medium text-slate-600">Date & Time</span>
                 <span className="font-semibold text-slate-800">
-                  {new Date(selectedInvoice.date).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })} {selectedInvoice.time ? `• ${selectedInvoice.time}` : ''}
+                  {/* FIX #5: Gunakan safeDateDisplay agar konsisten dan bebas UTC-shift */}
+                  {safeDateDisplay(selectedInvoice.date, 'en-US', { month: 'long', day: 'numeric', year: 'numeric' })} {selectedInvoice.time ? `• ${selectedInvoice.time}` : ''}
                 </span>
               </div>
               <div className="flex justify-between items-center border-b border-slate-100 py-3 px-2">
@@ -7433,7 +7541,12 @@ function StudentReadOnlyReportModule({ db, user, downloadPNG, handleShareImage, 
     : ['Speaking', 'Writing', 'Reading', 'Listening'];
 
   const isKindergarten = student.level === 'Kindergarten' || ['PAUD', 'TK A', 'TK B'].includes(student.class);
-  const latestAss = assessments.length > 0 ? assessments[0] : null;
+  // Fix #9: sort agar [0] selalu record terbaru (handle kemungkinan duplikat)
+  const sortedReportAssessments = [...assessments].sort((a, b) => {
+    if (Number(b.year) !== Number(a.year)) return Number(b.year) - Number(a.year);
+    return Number(b.month) - Number(a.month);
+  });
+  const latestAss = sortedReportAssessments.length > 0 ? sortedReportAssessments[0] : null;
   const scores = latestAss && latestAss.scores ? latestAss.scores : {};
   const getScore = (subject) => Number(scores[subject]) || 0;
 
@@ -7558,7 +7671,8 @@ function StudentReadOnlyReportModule({ db, user, downloadPNG, handleShareImage, 
                   {assessments.length > 0 && (
                      <div className="bg-[#F8FAFC] border border-slate-100 rounded-lg p-1.5 flex items-center justify-between h-[30px]">
                         <span className="text-[11px] text-slate-500 font-medium uppercase tracking-wide">Final Grade</span>
-                        <span className="font-black text-base text-blue-600 leading-none">{assessments[0]?.grade || '—'}</span>
+                        {/* Fix #9: sortedReportAssessments[0] — record terbaru */}
+                        <span className="font-black text-base text-blue-600 leading-none">{sortedReportAssessments[0]?.grade || '—'}</span>
                      </div>
                   )}
                </div>
@@ -8753,7 +8867,7 @@ function DataExportModule({ db }) {
     const totalStudentsCount = db.students.length;
     const activeTutorsCount = db.tutors.filter((t) => t.status === 'Active').length;
     const monthlyRevenue = db.payments
-      .filter((p) => p.status === 'Paid' && p.month === currentMonth && p.year === currentYear)
+      .filter((p) => p.status === 'Paid' && Number(p.month) === Number(currentMonth) && String(p.year) === String(currentYear))
       .reduce((sum, p) => sum + Number(p.amount), 0);
     const totalRevenueAllTime = db.payments
       .filter((p) => p.status === 'Paid')
@@ -8952,7 +9066,23 @@ function RecycleBinModule({ db, setDb, showToast, requestConfirm }) {
 
   const handleRestore = (item) => {
     requestConfirm('Restore Item', 'Are you sure you want to restore this record?', () => {
-      setDb((p) => ({ ...p, [item.originalCollection]: [...p[item.originalCollection], item.data], recycleBin: p.recycleBin.filter((x) => x.binId !== item.binId) }));
+      // BUGFIX #12: Normalize dates in restored item so ISO strings don't persist
+      const restoreData = (() => {
+        const d = { ...item.data };
+        const toLocalDate = (s) => {
+          if (typeof s === 'string' && s.includes('T') && s.includes('Z')) {
+            const dt = new Date(s);
+            if (!isNaN(dt.getTime())) return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth()+1).padStart(2,'0')}-${String(dt.getUTCDate()).padStart(2,'0')}`;
+          }
+          return s;
+        };
+        if (d.date) d.date = toLocalDate(d.date);
+        if (d.joinedDate) d.joinedDate = toLocalDate(d.joinedDate);
+        if (d.whatsapp) d.whatsapp = normalizeWhatsapp(d.whatsapp);
+        if (d.phone) d.phone = normalizeWhatsapp(d.phone);
+        return d;
+      })();
+      setDb((p) => ({ ...p, [item.originalCollection]: [...p[item.originalCollection], restoreData], recycleBin: p.recycleBin.filter((x) => x.binId !== item.binId) }));
       showToast('Item Restored');
     });
   };
@@ -9351,7 +9481,7 @@ function MaterialsModule({ db, setDb, generateId, showToast, softDelete, user })
                senderRole: 'tutor',
                senderName: user.name,
                text,
-               date: new Date().toLocaleString('en-GB', { dateStyle: 'short', timeStyle: 'short' })
+               date: (() => { const _n = new Date(); return `${String(_n.getDate()).padStart(2,'0')}/${String(_n.getMonth()+1).padStart(2,'0')}/${_n.getFullYear()}, ${String(_n.getHours()).padStart(2,'0')}:${String(_n.getMinutes()).padStart(2,'0')}`; })()
            }];
            newMats[matIdx].submissions[subIdx].checked = true; // Auto-check saat tutor mereply
         }
@@ -9361,7 +9491,15 @@ function MaterialsModule({ db, setDb, generateId, showToast, softDelete, user })
   };
 
   const myMats = (db.materials || []).filter(m => {
-     if (user.role !== 'admin' && m.sessionGroup !== user.teachingSession) return false;
+     // FIX #4: Gunakan fuzzy match agar tutor bisa melihat materi yang sama yang terlihat siswa.
+     // Mencegah kasus di mana tutor tidak bisa lihat/kelola materi yang sudah terlihat siswa
+     // akibat perbedaan minor pada sessionGroup (spasi, nama dari c.name vs SESSIONS[]).
+     if (user.role !== 'admin') {
+       const _tSession = (user.teachingSession || '').toLowerCase();
+       const _mSession = (m.sessionGroup || '').toLowerCase();
+       const _sessionOk = _tSession && _mSession && (_tSession === _mSession || _tSession.includes(_mSession) || _mSession.includes(_tSession));
+       if (!_sessionOk) return false;
+     }
      
      if (filterMonth !== 'All') {
         const prefix = `${filterYear}-${String(filterMonth).padStart(2, '0')}`;
@@ -9638,7 +9776,7 @@ function StudentMaterialsModule({ db, setDb, user, showToast, language = 'en' })
                senderRole: 'student',
                senderName: student?.name || 'Student',
                text,
-               date: new Date().toLocaleString('en-GB', { dateStyle: 'short', timeStyle: 'short' })
+               date: (() => { const _n = new Date(); return `${String(_n.getDate()).padStart(2,'0')}/${String(_n.getMonth()+1).padStart(2,'0')}/${_n.getFullYear()}, ${String(_n.getHours()).padStart(2,'0')}:${String(_n.getMinutes()).padStart(2,'0')}`; })()
            }];
            newMats[matIdx].submissions[existingSubIdx].checked = false; // Mark as unread/unchecked for tutor
         } else {
@@ -9647,7 +9785,7 @@ function StudentMaterialsModule({ db, setDb, user, showToast, language = 'en' })
              studentId: student?.id,
              studentName: student?.name || 'Student',
              text,
-             date: new Date().toLocaleString('en-GB', { dateStyle: 'short', timeStyle: 'short' }),
+             date: (() => { const _n = new Date(); return `${String(_n.getDate()).padStart(2,'0')}/${String(_n.getMonth()+1).padStart(2,'0')}/${_n.getFullYear()}, ${String(_n.getHours()).padStart(2,'0')}:${String(_n.getMinutes()).padStart(2,'0')}`; })(),
              checked: false,
              replies: []
            });
