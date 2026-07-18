@@ -3,7 +3,7 @@ import { Toaster, toast as sonnerToast } from 'sonner';
 import { Users, UserCheck, BookOpen, Calendar as CalendarIcon, DollarSign, FileText, Settings, LogOut, LayoutDashboard, Activity, ChartBar as BarChart3, Plus, Search, ListFilter as Filter, Download, Printer, Share2, Pencil as Edit2, UserCog, Trash2, CircleCheck as CheckCircle2, Circle as XCircle, ChevronDown, Menu, X, SquareCheck as CheckSquare, Briefcase, Bell, CircleAlert as AlertCircle, Eye, RefreshCw, Trash, ArchiveRestore, ArrowLeft, KeyRound, ShieldCheck, Shield, MessageSquare, GraduationCap, Clock, Hash, User, Award, QrCode, Quote, Cloud, CloudOff, Sun, CloudRain, CloudLightning, Droplets, Wind, Thermometer, Link as LinkIcon, MessageCircle, Check, Trophy, Target, Zap, Star, Medal, Mic, Terminal, Copy, Inbox, Database } from 'lucide-react';
 
 // Link Eksekusi Google App Script Anda
-const APPSCRIPT_URL = 'https://script.google.com/macros/s/AKfycbx5DB8FtAaTV23WggnHjyFFRlY7Dgn3W7MpBZkT4fC5-64J4nF8M6fKXkqfuSV6sdL-/exec';
+const APPSCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwz0N2JnMPXyP1x2RdUbf2dhdWnaHnkCt93l9p7Tmxw9FoW68_AAMxPK6KG_aX_POIy/exec';
 
 declare global {
   interface Window {
