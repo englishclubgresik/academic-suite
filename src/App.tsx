@@ -179,7 +179,7 @@ const calculateStudentEXP = (studentId, db) => {
    const student = db.students.find(s => s.id === studentId);
    const expFromSpeaking = (student?.speakingChallengeCompletedCount || 0) * 20; // 20 EXP per challenge
    
-   const bonusExp = student?.bonusExp || 0; // EXP manual dari tutor/admin
+   const bonusExp = Number(student?.bonusExp) || 0; // EXP manual dari tutor/admin
    
    return expFromAtt + expFromScore + (totalTasksDone * 30) + expFromSpeaking + bonusExp;
 };
@@ -1560,7 +1560,7 @@ const AdminDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                                         onKeyDown={(e) => {
                                            if (e.key === 'Enter') {
                                               const val = Number(e.currentTarget.value) || 0;
-                                              setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (stu.bonusExp || 0) + val } : stu) }));
+                                              setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (Number(stu.bonusExp) || 0) + val } : stu) }));
                                               showToast(language === 'id' ? `Berhasil menyesuaikan ${val} EXP untuk ${expModalStudent.name}` : `Successfully adjusted ${val} EXP for ${expModalStudent.name}`);
                                               setExpModalStudent(null);
                                               setExpInput('');
@@ -1572,7 +1572,7 @@ const AdminDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                                      />
                                      <button type="button" onClick={() => {
                                         const val = Number(expInput) || 0;
-                                        setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (stu.bonusExp || 0) + val } : stu) }));
+                                        setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (Number(stu.bonusExp) || 0) + val } : stu) }));
                                         showToast(language === 'id' ? `Berhasil menyesuaikan ${val} EXP untuk ${expModalStudent.name}` : `Successfully adjusted ${val} EXP for ${expModalStudent.name}`);
                                         setExpModalStudent(null);
                                         setExpInput('');
@@ -1828,7 +1828,7 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                                         onKeyDown={(e) => {
                                            if (e.key === 'Enter') {
                                               const val = Number(e.currentTarget.value) || 0;
-                                              setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (stu.bonusExp || 0) + val } : stu) }));
+                                              setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (Number(stu.bonusExp) || 0) + val } : stu) }));
                                               showToast(language === 'id' ? `Berhasil menyesuaikan ${val} EXP untuk ${expModalStudent.name}` : `Successfully adjusted ${val} EXP for ${expModalStudent.name}`);
                                               setExpModalStudent(null);
                                               setExpInput('');
@@ -1840,7 +1840,7 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                                      />
                                      <button type="button" onClick={() => {
                                         const val = Number(expInput) || 0;
-                                        setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (stu.bonusExp || 0) + val } : stu) }));
+                                        setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (Number(stu.bonusExp) || 0) + val } : stu) }));
                                         showToast(language === 'id' ? `Berhasil menyesuaikan ${val} EXP untuk ${expModalStudent.name}` : `Successfully adjusted ${val} EXP for ${expModalStudent.name}`);
                                         setExpModalStudent(null);
                                         setExpInput('');
@@ -2255,6 +2255,11 @@ function MainApp() {
   // BUGFIX #6: Ganti window._syncBusyAttempt (global, race condition multi-tab)
   // dengan useRef yang scoped ke instance komponen ini saja.
   const syncBusyAttempt = useRef(0);
+  // FIX DELTA PAYLOAD: Snapshot db terakhir yang BERHASIL tersinkron ke cloud.
+  // Digunakan untuk menghitung delta (koleksi mana yang berubah) sebelum kirim ke server.
+  // Dengan ini, kita TIDAK mengirim seluruh db — hanya koleksi yang benar-benar berubah,
+  // sehingga data koleksi lain yang mungkin diubah user lain tidak akan tertimpa.
+  const lastSyncedSnapshotRef = useRef(null);
   // NEW: Ref untuk mencegah infinite loop saat proses exit browser
   const isExiting = useRef(false);
 
@@ -2703,6 +2708,31 @@ function MainApp() {
         const token = getAuthToken();
         if (!token) return handleUnauthorized();
 
+        // ── DELTA PAYLOAD ────────────────────────────────────────────────────────
+        // Hanya kirim koleksi yang BENAR-BENAR berubah sejak sync terakhir berhasil.
+        // Ini mencegah koleksi lain (yang mungkin diubah user lain) tertimpa oleh
+        // snapshot lokal yang sudah stale. Backend hanya akan menulis sheet yang dikirim.
+        const DELTA_COLS = [
+          'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
+          'journals', 'assessments', 'payments', 'payroll', 'calendar',
+          'announcements', 'recycleBin', 'materials'
+        ];
+        const lastSnap = (() => {
+          if (!lastSyncedSnapshotRef.current) return {};
+          try { return JSON.parse(lastSyncedSnapshotRef.current); } catch(e) { return {}; }
+        })();
+        const deltaPayload: Record<string, unknown> = {};
+        DELTA_COLS.forEach(col => {
+          // Bandingkan setiap koleksi dengan snapshot terakhir yang tersinkron
+          if (JSON.stringify(db[col]) !== JSON.stringify(lastSnap[col])) {
+            deltaPayload[col] = db[col];
+          }
+        });
+        // Log selalu disertakan (tidak mempengaruhi data utama)
+        deltaPayload.auditLogs = logsRef.current.auditLogs;
+        deltaPayload.debugLogs = logsRef.current.debugLogs;
+        // ─────────────────────────────────────────────────────────────────────────
+
         // Sinkronisasi ke Google App Script (Dilengkapi Token & DB Version)
         fetch(APPSCRIPT_URL, {
           method: 'POST',
@@ -2712,13 +2742,13 @@ function MainApp() {
           },
           // WAJIB 2: Google Apps Script melakukan 302 Redirect setelah POST. Browser harus mengikutinya.
           redirect: 'follow',
-          // Membungkus data sesuai struktur baru NEXUS PRIME ENGINE
+          // Kirim hanya delta — bukan seluruh db
           body: JSON.stringify({ 
             action: 'sync', 
             token: token,
             baseVersion: dbVersion.current, // Kirim versi DB yang kita ketahui → backend tolak kalau konflik
             user: currentUser ? currentUser.name : 'SYSTEM', // Mengirimkan identitas untuk Audit Log
-            payload: { ...db, auditLogs: logsRef.current.auditLogs, debugLogs: logsRef.current.debugLogs } 
+            payload: deltaPayload  // ← DELTA, bukan { ...db }
           })
         })
         .then(res => {
@@ -2736,39 +2766,53 @@ function MainApp() {
                // tidak terus memblokir data cloud di sesi yang sama.
                isDbDirty.current = false;
                syncBusyAttempt.current = 0;
+               // FIX DELTA: Simpan snapshot db saat ini sebagai baseline untuk delta berikutnya.
+               // Hanya diupdate saat sync BERHASIL — saat error/busy/conflict, snapshot tetap
+               // di versi lama agar koleksi yang gagal terkirim akan masuk delta berikutnya.
+               lastSyncedSnapshotRef.current = JSON.stringify({
+                 users: db.users, students: db.students, tutors: db.tutors,
+                 studentAttendance: db.studentAttendance, tutorAttendance: db.tutorAttendance,
+                 journals: db.journals, assessments: db.assessments, payments: db.payments,
+                 payroll: db.payroll, calendar: db.calendar, announcements: db.announcements,
+                 recycleBin: db.recycleBin, materials: db.materials
+               });
                setIsCloudConnected(true);
                setSyncStatus('saved'); // SET INDIKATOR BERHASIL
            } else if (data.status === 'conflict') {
-               // FIX 4: Conflict — auto-fetch versi terbaru dari server, update dbVersion,
-               // lalu trigger sync ulang. User tidak perlu refresh manual.
-               // Server mengirimkan currentVersion di response — pakai itu.
-               console.warn('DATABASE CONFLICT — auto-resolving by fetching latest from server');
+               // FIX CONFLICT: Server mengirim data.payload (full db terbaru) langsung dalam
+               // response conflict — kita PAKAI LANGSUNG tanpa request GET kedua yang redundan.
+               // Ini lebih cepat dan mencegah race condition akibat 2 request paralel.
+               console.warn('DATABASE CONFLICT — resolving with payload from conflict response');
                showToast(
                  language === 'id'
                    ? 'Data diperbarui pengguna lain. Menyelaraskan data...'
                    : 'Data updated by another user. Syncing latest...',
                  'warning'
                );
-               const conflictToken = getAuthToken();
-               if (conflictToken) {
-                 fetch(`${APPSCRIPT_URL}?token=${conflictToken}`)
-                   .then(r => r.json())
-                   .then(freshData => {
-                     if (freshData.status === 'success' && freshData.payload) {
-                       const merged = normalizeData(freshData.payload);
-                       if (freshData._dbVersion) dbVersion.current = freshData._dbVersion;
-                       skipCloudSave.current = true;
-                       // BUGFIX #4: Reset isDbDirty SEBELUM setDb agar useEffect db tidak
-                       // langsung mengirim ulang data lokal lama ke cloud (infinite overwrite loop).
-                       isDbDirty.current = false;
-                       setDb(merged);
-                       setSyncStatus('saved');
-                       setIsCloudConnected(true);
-                     } else {
-                       setSyncStatus('error');
-                     }
-                   })
-                   .catch(() => setSyncStatus('error'));
+               // data.payload SUDAH tersedia dari response conflict (lihat processSync di code.gs)
+               const freshPayload = data.payload;
+               const freshVersion  = data.newVersion ?? data._dbVersion ?? null;
+               if (freshPayload) {
+                 const merged = normalizeData(freshPayload);
+                 if (freshVersion) dbVersion.current = freshVersion;
+
+                 // BUGFIX CONFLICT: Jika user SEDANG mengedit (isDbDirty), JANGAN timpa
+                 // data lokal — pancing retry sync agar data user ikut terkirim ke server.
+                 if (isDbDirty.current) {
+                   showToast('Konflik database! Sistem sedang menyelaraskan data Anda ke server...', 'warning');
+                   // Bypass guard prevEntitiesRef agar retry sync benar-benar terpicu
+                   prevEntitiesRef.current = null;
+                   setDb(prev => ({ ...prev }));
+                 } else {
+                   // User tidak sedang mengedit → aman terapkan data server
+                   skipCloudSave.current = true;
+                   isDbDirty.current = false;
+                   // Reset snapshot agar delta berikutnya dihitung dari kondisi server terkini
+                   lastSyncedSnapshotRef.current = null;
+                   setDb(merged);
+                   setSyncStatus('saved');
+                   setIsCloudConnected(true);
+                 }
                } else {
                  setSyncStatus('error');
                }
@@ -2785,6 +2829,10 @@ function MainApp() {
                setTimeout(() => {
                  syncBusyAttempt.current = 0; // reset counter setelah retry
                  isDbDirty.current = true;    // paksa useEffect db untuk trigger sync ulang
+                 // BUGFIX BUSY-RETRY: Null-kan prevEntitiesRef agar guard equality check
+                 // tidak memblokir sync. Tanpa ini, retry selalu dianggap "no change" dan
+                 // data yang pending tidak pernah terkirim ke server.
+                 prevEntitiesRef.current = null;
                  setDb(prev => ({ ...prev })); // trigger useEffect dengan shallow copy
                }, delay);
            } else {
@@ -4481,6 +4529,8 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
   const [viewingStudentId, setViewingStudentId] = useState(null);
   const [amounts, setAmounts] = useState({});
   const [methods, setMethods] = useState({});
+  const [showQuickOverview, setShowQuickOverview] = useState(false);
+  const [overviewFilter, setOverviewFilter] = useState<'all' | 'paid' | 'unpaid' | 'partial'>('all');
 
   useEffect(() => {
     setCurrentPage(1);
@@ -4509,7 +4559,7 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
   const totalRevenue = useMemo(() => {
     const validStudentIds = new Set(filteredStudents.map(s => s.id));
     return db.payments
-      .filter(p => p.month === String(month) && p.year === String(year) && p.status === 'Paid' && validStudentIds.has(p.studentId))
+      .filter(p => Number(p.month) === Number(month) && String(p.year) === String(year) && p.status === 'Paid' && validStudentIds.has(p.studentId))
       .reduce((sum, p) => sum + Number(p.amount), 0);
   }, [db.payments, month, year, filteredStudents]);
 
@@ -4659,7 +4709,7 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
                     </tr>
                  </thead>
                  <tbody className="divide-y divide-gray-800">
-                    {db.payments.filter(p => p.studentId === viewingStudentId && p.month === String(month) && p.year === String(year) && p.status === 'Paid').map((p, index) => (
+                    {db.payments.filter(p => p.studentId === viewingStudentId && Number(p.month) === Number(month) && String(p.year) === String(year) && p.status === 'Paid').map((p, index) => (
                        <tr key={p.id} className="hover:bg-[#0B0F19]">
                           <td className="p-3 text-center text-gray-500 font-medium">{index + 1}</td>
                           <td className="p-3 text-center font-mono text-gray-500 text-xs">{p.id}</td>
@@ -4712,6 +4762,212 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
         <p className="text-2xl font-bold text-white">Rp {totalRevenue.toLocaleString()}</p>
       </div>
 
+      {/* ─── PAYMENT QUICK OVERVIEW PANEL ─── */}
+      {(() => {
+        // Compute per-student status for ALL active students (not just paginated)
+        const allStudentStatuses = activeStudents.map((s) => {
+          const pays = db.payments.filter(
+            (p) => p.studentId === s.id && Number(p.month) === Number(month) && String(p.year) === String(year) && p.status === 'Paid'
+          );
+          const totalPaid = pays.reduce((sum, p) => sum + Number(p.amount), 0);
+          const target = getStudentTarget(s);
+          const lastPay = pays.sort((a, b) => (a.date > b.date ? -1 : 1))[0];
+          let status: 'Paid' | 'Unpaid' | 'Partial' | 'No Target' | 'Debt' | 'Deposit' = 'Unpaid';
+          if (target === 0 && totalPaid === 0) status = 'No Target';
+          else if (s.paymentPlan === 'Per Visit') {
+            const bal = totalPaid - target;
+            if (bal < 0) status = 'Debt';
+            else if (bal > 0) status = 'Deposit';
+            else if (bal === 0 && target > 0) status = 'Paid';
+            else status = 'No Target';
+          } else {
+            if (totalPaid >= target && target > 0) status = 'Paid';
+            else if (totalPaid > 0) status = 'Partial';
+          }
+          return { s, pays, totalPaid, target, lastPay, status };
+        });
+
+        const paidCount = allStudentStatuses.filter(x => x.status === 'Paid' || x.status === 'Deposit').length;
+        const unpaidCount = allStudentStatuses.filter(x => x.status === 'Unpaid' || x.status === 'Debt').length;
+        const partialCount = allStudentStatuses.filter(x => x.status === 'Partial').length;
+        const totalActive = allStudentStatuses.filter(x => x.status !== 'No Target').length;
+        const paidPct = totalActive > 0 ? Math.round((paidCount / totalActive) * 100) : 0;
+
+        const filtered = overviewFilter === 'all' ? allStudentStatuses
+          : overviewFilter === 'paid' ? allStudentStatuses.filter(x => x.status === 'Paid' || x.status === 'Deposit')
+          : overviewFilter === 'unpaid' ? allStudentStatuses.filter(x => x.status === 'Unpaid' || x.status === 'Debt')
+          : allStudentStatuses.filter(x => x.status === 'Partial');
+
+        const statusColor = {
+          Paid: 'text-emerald-400', Deposit: 'text-cyan-400',
+          Unpaid: 'text-rose-400', Debt: 'text-red-400',
+          Partial: 'text-amber-400', 'No Target': 'text-gray-500',
+        };
+        const statusBg = {
+          Paid: 'bg-emerald-500/10 border-emerald-500/30', Deposit: 'bg-cyan-500/10 border-cyan-500/30',
+          Unpaid: 'bg-rose-500/10 border-rose-500/30', Debt: 'bg-red-500/10 border-red-500/30',
+          Partial: 'bg-amber-500/10 border-amber-500/30', 'No Target': 'bg-gray-800/50 border-gray-700',
+        };
+
+        return (
+          <Card className="p-0 overflow-hidden border border-gray-800">
+            {/* Header row — always visible */}
+            <div
+              className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 px-5 py-4 bg-[#0A0E17] cursor-pointer select-none"
+              onClick={() => setShowQuickOverview(v => !v)}
+            >
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-lg bg-violet-500/20 border border-violet-500/30 flex items-center justify-center shrink-0">
+                  <span className="text-violet-400 text-base">👁️</span>
+                </div>
+                <div>
+                  <p className="text-sm font-bold text-white">{language === 'id' ? 'Ringkasan Status Bayar — Cepat' : 'Quick Payment Overview'}</p>
+                  <p className="text-xs text-gray-400">{MONTHS[month - 1]} {year} · {language === 'id' ? 'Klik untuk' : 'Click to'} {showQuickOverview ? (language === 'id' ? 'tutup' : 'collapse') : (language === 'id' ? 'buka' : 'expand')}</p>
+                </div>
+              </div>
+              {/* Mini stat chips */}
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 text-xs font-bold">✓ {paidCount} {language === 'id' ? 'Lunas' : 'Paid'}</span>
+                <span className="px-3 py-1 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-400 text-xs font-bold">◑ {partialCount} {language === 'id' ? 'Parsial' : 'Partial'}</span>
+                <span className="px-3 py-1 rounded-full bg-rose-500/15 border border-rose-500/30 text-rose-400 text-xs font-bold">✗ {unpaidCount} {language === 'id' ? 'Belum' : 'Unpaid'}</span>
+                <span className="px-3 py-1 rounded-full bg-[#151B26] border border-gray-700 text-gray-300 text-xs font-bold">{paidPct}% {language === 'id' ? 'terkumpul' : 'collected'}</span>
+                <span className="text-gray-600 text-lg ml-1">{showQuickOverview ? '▲' : '▼'}</span>
+              </div>
+            </div>
+
+            {showQuickOverview && (
+              <div className="border-t border-gray-800">
+                {/* Progress bar */}
+                <div className="px-5 pt-4 pb-2">
+                  <div className="flex justify-between text-[11px] text-gray-400 mb-1">
+                    <span>{language === 'id' ? 'Tingkat pelunasan' : 'Collection rate'}</span>
+                    <span className="font-bold text-white">{paidPct}%</span>
+                  </div>
+                  <div className="w-full h-2 bg-gray-800 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-emerald-500 to-cyan-400 rounded-full transition-all duration-500"
+                      style={{ width: `${paidPct}%` }}
+                    />
+                  </div>
+                  <div className="flex justify-between text-[10px] text-gray-600 mt-1">
+                    <span>{paidCount} {language === 'id' ? 'dari' : 'of'} {totalActive} {language === 'id' ? 'siswa aktif' : 'active students'}</span>
+                    <span>{unpaidCount + partialCount} {language === 'id' ? 'belum lunas' : 'outstanding'}</span>
+                  </div>
+                </div>
+
+                {/* Filter tabs */}
+                <div className="px-5 py-3 flex gap-2 flex-wrap border-t border-gray-800/60">
+                  {(['all', 'paid', 'unpaid', 'partial'] as const).map(f => (
+                    <button
+                      key={f}
+                      onClick={() => setOverviewFilter(f)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all border ${overviewFilter === f
+                        ? f === 'paid' ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300'
+                        : f === 'unpaid' ? 'bg-rose-500/20 border-rose-500/50 text-rose-300'
+                        : f === 'partial' ? 'bg-amber-500/20 border-amber-500/50 text-amber-300'
+                        : 'bg-violet-500/20 border-violet-500/50 text-violet-300'
+                        : 'bg-[#0A0E17] border-gray-700 text-gray-400 hover:border-gray-500'
+                      }`}
+                    >
+                      {f === 'all' ? `${language === 'id' ? 'Semua' : 'All'} (${allStudentStatuses.length})`
+                        : f === 'paid' ? `✓ ${language === 'id' ? 'Lunas' : 'Paid'} (${paidCount})`
+                        : f === 'unpaid' ? `✗ ${language === 'id' ? 'Belum Bayar' : 'Unpaid'} (${unpaidCount})`
+                        : `◑ ${language === 'id' ? 'Parsial' : 'Partial'} (${partialCount})`}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Cards grid */}
+                <div className="px-4 pb-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 max-h-[480px] overflow-y-auto">
+                  {filtered.length === 0 && (
+                    <div className="col-span-full py-10 text-center text-gray-500 text-sm">
+                      {language === 'id' ? 'Tidak ada siswa dengan status ini.' : 'No students with this status.'}
+                    </div>
+                  )}
+                  {filtered.map(({ s, pays, totalPaid, target, lastPay, status }) => {
+                    const balance = totalPaid - target;
+                    const pct = target > 0 ? Math.min(100, Math.round((totalPaid / target) * 100)) : 0;
+                    return (
+                      <div
+                        key={s.id}
+                        className={`rounded-xl border p-3.5 flex flex-col gap-2 transition-all hover:-translate-y-0.5 hover:shadow-lg ${statusBg[status] || 'bg-gray-800/50 border-gray-700'}`}
+                      >
+                        {/* Student name + plan badge */}
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="text-sm font-bold text-white truncate">{s.name}</p>
+                            <p className="text-[11px] text-gray-400">{s.class}</p>
+                          </div>
+                          <span className={`shrink-0 text-[10px] px-2 py-0.5 rounded-full border font-bold uppercase tracking-wide ${s.paymentPlan === 'Per Visit' ? 'bg-purple-500/20 text-purple-300 border-purple-500/40' : 'bg-blue-500/20 text-blue-300 border-blue-500/40'}`}>
+                            {s.paymentPlan === 'Per Visit' ? 'Per Visit' : 'Monthly'}
+                          </span>
+                        </div>
+
+                        {/* Status badge */}
+                        <div className="flex items-center gap-2">
+                          <Badge status={status} />
+                          {pays.length > 0 && (
+                            <span className="text-[10px] text-gray-500">{pays.length}x {language === 'id' ? 'transaksi' : 'transaction(s)'}</span>
+                          )}
+                        </div>
+
+                        {/* Amount paid / target */}
+                        {target > 0 && (
+                          <>
+                            <div className="flex justify-between text-xs">
+                              <span className="text-gray-400">{language === 'id' ? 'Dibayar' : 'Paid'}</span>
+                              <span className={`font-bold ${statusColor[status] || 'text-gray-300'}`}>Rp {totalPaid.toLocaleString()}</span>
+                            </div>
+                            <div className="flex justify-between text-xs">
+                              <span className="text-gray-400">{language === 'id' ? 'Target' : 'Target'}</span>
+                              <span className="text-gray-300 font-medium">Rp {target.toLocaleString()}</span>
+                            </div>
+                            {/* Mini progress bar */}
+                            <div className="w-full h-1.5 bg-gray-800 rounded-full overflow-hidden">
+                              <div
+                                className={`h-full rounded-full transition-all duration-300 ${status === 'Paid' || status === 'Deposit' ? 'bg-emerald-400' : status === 'Partial' ? 'bg-amber-400' : 'bg-rose-500'}`}
+                                style={{ width: `${pct}%` }}
+                              />
+                            </div>
+                            {s.paymentPlan === 'Per Visit' && (
+                              <div className="flex justify-between text-xs">
+                                <span className="text-gray-400">{balance < 0 ? (language === 'id' ? 'Sisa Tagihan' : 'Remaining') : (language === 'id' ? 'Saldo/Deposit' : 'Deposit')}</span>
+                                <span className={`font-bold ${balance < 0 ? 'text-red-400' : 'text-cyan-400'}`}>Rp {Math.abs(balance).toLocaleString()}</span>
+                              </div>
+                            )}
+                          </>
+                        )}
+
+                        {/* Payment history — tanggal dan nominal */}
+                        {pays.length > 0 && (
+                          <div className="mt-1 border-t border-gray-700/50 pt-2 flex flex-col gap-1">
+                            <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mb-0.5">{language === 'id' ? 'Riwayat Bayar' : 'Payment History'}</p>
+                            {pays.sort((a, b) => (a.date > b.date ? 1 : -1)).map((p, i) => (
+                              <div key={i} className="flex justify-between items-center text-[11px]">
+                                <span className="text-gray-400">{p.date ? p.date.split('T')[0] : '-'} <span className="text-gray-600">·</span> <span className="text-gray-500">{p.method || 'Cash'}</span></span>
+                                <span className="text-white font-semibold">Rp {Number(p.amount).toLocaleString()}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Belum bayar sama sekali */}
+                        {pays.length === 0 && target > 0 && (
+                          <div className="mt-1 border-t border-gray-700/50 pt-2">
+                            <p className="text-[11px] text-rose-400/80 italic">{language === 'id' ? 'Belum ada pembayaran.' : 'No payment recorded yet.'}</p>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </Card>
+        );
+      })()}
+      {/* ─── END PAYMENT QUICK OVERVIEW ─── */}
+
       <Card className="p-0 overflow-hidden flex flex-col">
         {/* Unified Filter Row: Month, Year, Session, Search, Level, Class - all in one Card */}
         <div className="p-4 sm:p-5 bg-[#0A0E17] border-b border-gray-800 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
@@ -4741,7 +4997,7 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
           </thead>
           <tbody className="divide-y divide-gray-800">
             {paginatedData.map((s, index) => {
-              const studentPayments = db.payments.filter((p) => p.studentId === s.id && p.month === String(month) && p.year === String(year) && p.status === 'Paid');
+              const studentPayments = db.payments.filter((p) => p.studentId === s.id && Number(p.month) === Number(month) && String(p.year) === String(year) && p.status === 'Paid');
               const totalPaid = studentPayments.reduce((sum, p) => sum + Number(p.amount), 0);
               const target = getStudentTarget(s);
               
@@ -5983,7 +6239,7 @@ function PayrollModule({ db, setDb, generateId, showToast, handlePrint, handleSh
   const generatePayroll = () => {
      const newPayrolls = [];
      activeTutors.forEach(tutor => {
-        const existing = db.payroll.find(p => p.tutorId === tutor.id && p.month === String(month) && p.year === String(year));
+        const existing = db.payroll.find(p => p.tutorId === tutor.id && Number(p.month) === Number(month) && String(p.year) === String(year));
         if (existing) return;
 
         const base = Number(tutor.baseSalary) || 0;
@@ -6058,7 +6314,7 @@ function PayrollModule({ db, setDb, generateId, showToast, handlePrint, handleSh
      });
   };
 
-  const filteredPayroll = db.payroll.filter(p => p.month === String(month) && p.year === String(year));
+  const filteredPayroll = db.payroll.filter(p => Number(p.month) === Number(month) && String(p.year) === String(year));
 
   // Pagination Logic
   const isAll = rowsPerPage === 'All';
