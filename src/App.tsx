@@ -111,6 +111,24 @@ const normalizeTimestamp = (raw) => {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
 };
 
+// BUGFIX PAYMENT HILANG: Merge dua array berdasarkan field 'id' unik.
+// Menggantikan logika "ambil yang lebih panjang" yang menyebabkan data hilang
+// ketika satu sisi (lokal/cloud) lebih panjang di koleksi BERBEDA.
+// Hasilnya: union dari kedua array — tidak ada item yang hilang dari sisi manapun.
+// Jika id sama, versi LOKAL diutamakan (karena mungkin belum tersync ke cloud).
+const mergeByIds = (local: any[], cloud: any[]): any[] => {
+  const localArr = Array.isArray(local) ? local : [];
+  const cloudArr = Array.isArray(cloud) ? cloud : [];
+  // Mulai dari cloud, lalu tambahkan item lokal yang ID-nya belum ada di cloud
+  const merged = new Map<string, any>();
+  // 1. Masukkan semua item cloud sebagai baseline
+  cloudArr.forEach(item => { if (item?.id) merged.set(String(item.id), item); });
+  // 2. Item lokal menimpa/menambahkan — lokal selalu lebih prioritas
+  //    karena item lokal mungkin baru ditambah dan belum tersync
+  localArr.forEach(item => { if (item?.id) merged.set(String(item.id), item); });
+  return Array.from(merged.values());
+};
+
 const MONTHS = [
   'January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December',
@@ -2259,7 +2277,24 @@ function MainApp() {
   // Digunakan untuk menghitung delta (koleksi mana yang berubah) sebelum kirim ke server.
   // Dengan ini, kita TIDAK mengirim seluruh db — hanya koleksi yang benar-benar berubah,
   // sehingga data koleksi lain yang mungkin diubah user lain tidak akan tertimpa.
-  const lastSyncedSnapshotRef = useRef(null);
+  // BUGFIX KRITIS: Inisialisasi dari localStorage agar delta pertama dihitung
+  // dari kondisi lokal terkini, bukan dari null (yang menyebabkan seluruh DB dikirim
+  // sebagai delta dan bisa menimpa data koleksi lain yang lebih baru di server).
+  const lastSyncedSnapshotRef = useRef<string | null>((() => {
+    try {
+      const saved = localStorage.getItem('ecg_db');
+      if (!saved) return null;
+      const parsed = JSON.parse(saved);
+      const SNAP_COLS = [
+        'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
+        'journals', 'assessments', 'payments', 'payroll', 'calendar',
+        'announcements', 'recycleBin', 'materials'
+      ];
+      const snap: Record<string, unknown> = {};
+      SNAP_COLS.forEach(col => { snap[col] = parsed[col] ?? []; });
+      return JSON.stringify(snap);
+    } catch { return null; }
+  })());
   // NEW: Ref untuk mencegah infinite loop saat proses exit browser
   const isExiting = useRef(false);
 
@@ -2628,14 +2663,37 @@ function MainApp() {
              const cloudCount = getCount(cloudDb);
              const userIsLoggedIn = !!getAuthToken();
 
-             // Hanya tolak data cloud jika: user SUDAH login DAN data lokal lebih baru
-             if (userIsLoggedIn && (isDbDirty.current || localCount > cloudCount)) {
-                console.warn('Local data is newer or has been modified. Overwrite prevented to secure data.');
+             // BUGFIX KRITIS (DATA HILANG): Jangan reject/accept seluruh data berdasarkan
+             // total count — ini menyebabkan data jurnal/absensi hilang jika cloud unggul
+             // di payments tapi lokal unggul di journals.
+             // Solusi: jika user sudah login & dirty → prioritaskan lokal sepenuhnya.
+             // Jika belum login/dirty → merge per-koleksi (ambil yang lebih panjang).
+             if (userIsLoggedIn && isDbDirty.current) {
+                console.warn('Local data is dirty (user edited). Overwrite prevented.');
                 return prevDb;
+             }
+
+             const MERGE_COLS_STARTUP = [
+               'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
+               'journals', 'assessments', 'payments', 'payroll', 'calendar',
+               'announcements', 'recycleBin', 'materials'
+             ];
+             const normalizedCloudStartup = normalizeData(cloudDb);
+             const mergedStartup: any = { ...normalizedCloudStartup };
+             if (userIsLoggedIn) {
+               // BUGFIX PAYMENT HILANG: Gunakan mergeByIds — gabungkan berdasarkan ID unik
+               // agar tidak ada data yang hilang dari sisi manapun (lokal maupun cloud).
+               // Logika lama "ambil yang lebih panjang" menyebabkan payment/data baru hilang
+               // jika koleksi lain di sisi yang kalah lebih banyak itemnya.
+               MERGE_COLS_STARTUP.forEach(col => {
+                 const local = Array.isArray(prevDb[col]) ? prevDb[col] : [];
+                 const cloud = Array.isArray(normalizedCloudStartup[col]) ? normalizedCloudStartup[col] : [];
+                 mergedStartup[col] = mergeByIds(local, cloud);
+               });
              }
              
              skipCloudSave.current = true;
-             const mergedData = normalizeData(cloudDb);
+             const mergedData = mergedStartup;
              localStorage.setItem('ecg_db', JSON.stringify(mergedData));
              // FIX: Muat logs dari cloud ke state terpisah (bukan ke db)
              setLogs({
@@ -2793,26 +2851,38 @@ function MainApp() {
                const freshPayload = data.payload;
                const freshVersion  = data.newVersion ?? data._dbVersion ?? null;
                if (freshPayload) {
-                 const merged = normalizeData(freshPayload);
+                 const freshNormalized = normalizeData(freshPayload);
                  if (freshVersion) dbVersion.current = freshVersion;
 
-                 // BUGFIX CONFLICT: Jika user SEDANG mengedit (isDbDirty), JANGAN timpa
-                 // data lokal — pancing retry sync agar data user ikut terkirim ke server.
-                 if (isDbDirty.current) {
-                   showToast('Konflik database! Sistem sedang menyelaraskan data Anda ke server...', 'warning');
-                   // Bypass guard prevEntitiesRef agar retry sync benar-benar terpicu
-                   prevEntitiesRef.current = null;
-                   setDb(prev => ({ ...prev }));
-                 } else {
-                   // User tidak sedang mengedit → aman terapkan data server
+                 // BUGFIX PAYMENT HILANG (CONFLICT): Selalu merge lokal+cloud berdasarkan ID,
+                 // JANGAN pernah setDb(merged) murni dari cloud — payment/data lokal yang
+                 // belum tersinkron akan hilang. Baik dirty maupun tidak, gunakan mergeByIds
+                 // agar data dari kedua sisi tetap ada. Lokal diutamakan untuk item yang sama.
+                 const CONFLICT_COLS = [
+                   'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
+                   'journals', 'assessments', 'payments', 'payroll', 'calendar',
+                   'announcements', 'recycleBin', 'materials'
+                 ];
+                 setDb(prevDb => {
+                   const conflictMerged: any = { ...freshNormalized };
+                   CONFLICT_COLS.forEach(col => {
+                     const local = Array.isArray(prevDb[col]) ? prevDb[col] : [];
+                     const cloud = Array.isArray(freshNormalized[col]) ? freshNormalized[col] : [];
+                     conflictMerged[col] = mergeByIds(local, cloud);
+                   });
                    skipCloudSave.current = true;
-                   isDbDirty.current = false;
-                   // Reset snapshot agar delta berikutnya dihitung dari kondisi server terkini
-                   lastSyncedSnapshotRef.current = null;
-                   setDb(merged);
-                   setSyncStatus('saved');
-                   setIsCloudConnected(true);
-                 }
+                   lastSyncedSnapshotRef.current = null; // paksa delta penuh di sync berikutnya
+                   localStorage.setItem('ecg_db', JSON.stringify(conflictMerged));
+                   return conflictMerged;
+                 });
+                 // Setelah merge, paksa retry sync agar data lokal yang di-merge terkirim ke server
+                 isDbDirty.current = true;
+                 prevEntitiesRef.current = null;
+                 setTimeout(() => {
+                   setDb(prev => ({ ...prev })); // trigger useEffect sync
+                 }, 500);
+                 setSyncStatus('saved');
+                 setIsCloudConnected(true);
                } else {
                  setSyncStatus('error');
                }
@@ -2983,16 +3053,29 @@ function MainApp() {
                    const localCount = getCount(prevDb);
                    const cloudCount = getCount(cloudDb);
                    
-                   // BUG FIX D: Post-login sync — jangan tolak data cloud kecuali
-                   // user sudah mengedit sesuatu SETELAH login (bukan dari sesi sebelumnya).
-                   // isDbDirty di-reset saat login berhasil, jadi guard ini aman.
+                   // BUGFIX KRITIS (DATA HILANG): Guard total-count tidak aman —
+                   // cloud +1 payment membuat cloudCount > localCount sehingga data
+                   // cloud (yang mungkin stale di jurnal/absensi) menimpa data lokal.
+                   // Solusi: merge per-koleksi — ambil yang lebih panjang dari setiap koleksi.
                    if (isDbDirty.current) return prevDb; // User sudah edit setelah login — prioritaskan lokal
-                   // Jika cloud punya lebih banyak data → pakai cloud (mungkin admin tambah data dari perangkat lain)
-                   // Jika lokal sama atau lebih banyak → tetap pakai lokal (data sudah terbaru)
-                   if (localCount > cloudCount) return prevDb;
-                   
+
+                   const MERGE_COLS = [
+                     'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
+                     'journals', 'assessments', 'payments', 'payroll', 'calendar',
+                     'announcements', 'recycleBin', 'materials'
+                   ];
+                   const normalizedCloud = normalizeData(cloudDb);
+                   // BUGFIX PAYMENT HILANG: Gunakan mergeByIds — gabungkan berdasarkan ID unik
+                   // agar tidak ada item yang hilang dari sisi manapun setelah login.
+                   const merged: any = { ...normalizedCloud };
+                   MERGE_COLS.forEach(col => {
+                     const local = Array.isArray(prevDb[col]) ? prevDb[col] : [];
+                     const cloud = Array.isArray(normalizedCloud[col]) ? normalizedCloud[col] : [];
+                     merged[col] = mergeByIds(local, cloud);
+                   });
+
                    skipCloudSave.current = true;
-                   const mergedData = normalizeData(cloudDb);
+                   const mergedData = merged;
                    localStorage.setItem('ecg_db', JSON.stringify(mergedData));
                    setLogs({
                       auditLogs: Array.isArray(cloudDb.auditLogs) ? cloudDb.auditLogs : [],
@@ -4581,8 +4664,30 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
     const method = methods[student.id] || 'Cash';
     const now = new Date();
     const timeStr = now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    const rec = { id: generateId('INV', 'payments'), studentId: student.id, studentName: student.name, level: student.level, class: student.class, sessionGroup: sSession, amount: amt, month: String(month), year: String(year), date: getTodayDateLocal(), time: timeStr, method: method, status: 'Paid' };
-    setDb((p) => ({ ...p, payments: [...p.payments, rec] }));
+    const rec = {
+      id: generateId('INV', 'payments'),
+      studentId: student.id,
+      studentName: student.name,
+      level: student.level,
+      class: student.class,
+      sessionGroup: sSession,
+      amount: Number(amt), // BUGFIX: Pastikan amount tersimpan sebagai Number, bukan string
+      month: String(month),
+      year: String(year),
+      date: getTodayDateLocal(),
+      time: timeStr,
+      method: method,
+      status: 'Paid'
+    };
+    // BUGFIX PAYMENT HILANG: Simpan payment baru ke localStorage SEGERA sebelum
+    // sync debounce (2 detik) selesai, agar jika tab ditutup/browser crash,
+    // data tidak hilang. setDb sudah memicu penyimpanan localStorage via useEffect,
+    // tapi kita tambah guard eksplisit di sini untuk keamanan ekstra.
+    setDb((p) => {
+      const updated = { ...p, payments: [...p.payments, rec] };
+      try { localStorage.setItem('ecg_db', JSON.stringify(updated)); } catch(e) {}
+      return updated;
+    });
     showToast(`Payment recorded`);
     setAmounts((p) => ({ ...p, [student.id]: '' }));
   };
