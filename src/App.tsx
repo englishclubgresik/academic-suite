@@ -111,21 +111,94 @@ const normalizeTimestamp = (raw) => {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
 };
 
-// BUGFIX PAYMENT HILANG: Merge dua array berdasarkan field 'id' unik.
-// Menggantikan logika "ambil yang lebih panjang" yang menyebabkan data hilang
-// ketika satu sisi (lokal/cloud) lebih panjang di koleksi BERBEDA.
-// Hasilnya: union dari kedua array — tidak ada item yang hilang dari sisi manapun.
-// Jika id sama, versi LOKAL diutamakan (karena mungkin belum tersync ke cloud).
-const mergeByIds = (local: any[], cloud: any[]): any[] => {
+// BUGFIX LWW, ORPHAN & PURGE: Merge dua array berdasarkan field 'id' unik dengan Last Write Wins.
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
+const mergeByIds = (local: any[], cloud: any[], recycleBin: any[] = []): any[] => {
   const localArr = Array.isArray(local) ? local : [];
   const cloudArr = Array.isArray(cloud) ? cloud : [];
-  // Mulai dari cloud, lalu tambahkan item lokal yang ID-nya belum ada di cloud
+  
+  // 1. Auto-Purge: Hanya baca item tong sampah yang usianya di bawah 30 Hari
+  const activeBin = recycleBin.filter(b => {
+    if (!b.deletedAt) return true;
+    const delTime = new Date(String(b.deletedAt).replace(' ', 'T')).getTime(); // Safe parsing
+    return !isNaN(delTime) && (Date.now() - delTime < THIRTY_DAYS_MS);
+  });
+  const binSet = new Set(activeBin.map((b: any) => String(b.data?.id)).filter(Boolean));
+  
   const merged = new Map<string, any>();
-  // 1. Masukkan semua item cloud sebagai baseline
-  cloudArr.forEach(item => { if (item?.id) merged.set(String(item.id), item); });
-  // 2. Item lokal menimpa/menambahkan — lokal selalu lebih prioritas
-  //    karena item lokal mungkin baru ditambah dan belum tersync
-  localArr.forEach(item => { if (item?.id) merged.set(String(item.id), item); });
+
+  // 2. Cascade Delete Checker (Mencegah Orphaned Records)
+  const isInvalid = (item: any) => {
+    if (!item || !item.id) return true;
+    if (binSet.has(String(item.id))) return true;
+    // Efek Domino: Jika studentId atau scheduleId item ini ada di tong sampah, item ini ikut diblokir
+    if (item.studentId && binSet.has(String(item.studentId))) return true;
+    if (item.scheduleId && binSet.has(String(item.scheduleId))) return true;
+    return false;
+  };
+
+  // 3. Last Write Wins (LWW) Time Parser
+  const parseTime = (item: any) => {
+    if (!item) return 0;
+    const t = item.updatedAt || item.timestamp || item.lastEditedAt || item.date;
+    if (!t) return 0;
+    const ms = new Date(String(t).replace(' ', 'T')).getTime();
+    return isNaN(ms) ? 0 : ms;
+  };
+
+  cloudArr.forEach(item => { 
+    if (!isInvalid(item)) merged.set(String(item.id), item); 
+  });
+
+  localArr.forEach(item => { 
+    if (!isInvalid(item)) {
+      const existing = merged.get(String(item.id));
+      if (existing) {
+         const timeLocal = parseTime(item);
+         const timeCloud = parseTime(existing);
+         
+         // BUGFIX: DEEP MERGE SUBMISSIONS PADA MATERIALS (Mencegah Tugas Saling Timpa)
+         if (Array.isArray(item.submissions) || Array.isArray(existing.submissions)) {
+             const mergedSubs = new Map();
+             (existing.submissions || []).forEach(s => mergedSubs.set(String(s.studentId), s));
+             (item.submissions || []).forEach(s => {
+                 const exSub = mergedSubs.get(String(s.studentId));
+                 if (exSub) {
+                     // LEVEL 3 DEEP MERGE: GABUNGKAN KOMENTAR (REPLIES) GURU & SISWA
+                     const mergedReplies = new Map();
+                     (exSub.replies || []).forEach(r => mergedReplies.set(r.date + r.senderName, r));
+                     (s.replies || []).forEach(r => mergedReplies.set(r.date + r.senderName, r));
+                     
+                     const timeS = parseTime(s);
+                     const timeEx = parseTime(exSub);
+                     
+                     if (timeS > timeEx) {
+                         s.replies = Array.from(mergedReplies.values());
+                         mergedSubs.set(String(s.studentId), s);
+                     } else {
+                         exSub.replies = Array.from(mergedReplies.values());
+                         mergedSubs.set(String(s.studentId), exSub);
+                     }
+                 } else {
+                     mergedSubs.set(String(s.studentId), s);
+                 }
+             });
+             // Simpan hasil gabungan ke item lokal
+             item.submissions = Array.from(mergedSubs.values());
+         }
+
+         // Jika data Cloud lebih mutakhir/baru dari Lokal, Cloud dipertahankan (Tidak ditimpa)
+         if (timeCloud > timeLocal && timeCloud > 0) {
+             // Pastikan hasil deep merge (tugas siswa) tetap selamat masuk ke versi Cloud
+             if (item.submissions) existing.submissions = item.submissions;
+             return;
+         }
+      }
+      merged.set(String(item.id), item); 
+    }
+  });
+
   return Array.from(merged.values());
 };
 
@@ -2064,6 +2137,16 @@ const normalizeData = (data) => {
          })) : mat.submissions
       }));
    }
+
+   // CLEANUP RECYCLE BIN: Hapus permanen data yang sudah lebih dari 30 hari di tong sampah
+   if (norm.recycleBin && Array.isArray(norm.recycleBin)) {
+      const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
+      norm.recycleBin = norm.recycleBin.filter(b => {
+         if (!b.deletedAt) return true;
+         const delTime = new Date(String(b.deletedAt).replace(' ', 'T')).getTime();
+         return isNaN(delTime) || (Date.now() - delTime < THIRTY_DAYS);
+      });
+   }
    // --- END PATCH BUG ---
 
    if (norm.users && Array.isArray(norm.users)) {
@@ -2148,6 +2231,9 @@ const CloudAutoSaveIndicator = ({ status, language }: { status: string, language
 
 function MainApp() {
   const [db, setDb] = useState(defaultDbStructure);
+  
+  const latestDbRef = useRef(db);
+  useEffect(() => { latestDbRef.current = db; }, [db]);
 
   // FIX (Silent Overwrite Race Condition): Logs dipisahkan dari db utama agar
   // penambahan audit/debug log TIDAK memicu sync useEffect yang akan menimpa
@@ -2297,6 +2383,20 @@ function MainApp() {
   })());
   // NEW: Ref untuk mencegah infinite loop saat proses exit browser
   const isExiting = useRef(false);
+
+  // BUGFIX: CEGAH TAB DITUTUP SAAT SEDANG SYNC ATAU ADA DATA BELUM TERSIMPAN
+  useEffect(() => {
+    const handleBeforeUnload = (e) => {
+      // Jika database masih kotor (baru diketik) atau sedang proses sinkronisasi
+      if (isDbDirty.current || syncStatus === 'syncing') {
+        e.preventDefault();
+        e.returnValue = 'Data Anda sedang disimpan ke Cloud. Yakin ingin keluar?';
+        return e.returnValue;
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [syncStatus]);
 
   const getAuthToken = () => sessionStorage.getItem('ecg_session_token');
 
@@ -2681,14 +2781,10 @@ function MainApp() {
              const normalizedCloudStartup = normalizeData(cloudDb);
              const mergedStartup: any = { ...normalizedCloudStartup };
              if (userIsLoggedIn) {
-               // BUGFIX PAYMENT HILANG: Gunakan mergeByIds — gabungkan berdasarkan ID unik
-               // agar tidak ada data yang hilang dari sisi manapun (lokal maupun cloud).
-               // Logika lama "ambil yang lebih panjang" menyebabkan payment/data baru hilang
-               // jika koleksi lain di sisi yang kalah lebih banyak itemnya.
                MERGE_COLS_STARTUP.forEach(col => {
                  const local = Array.isArray(prevDb[col]) ? prevDb[col] : [];
                  const cloud = Array.isArray(normalizedCloudStartup[col]) ? normalizedCloudStartup[col] : [];
-                 mergedStartup[col] = mergeByIds(local, cloud);
+                 mergedStartup[col] = mergeByIds(local, cloud, prevDb.recycleBin);
                });
              }
              
@@ -2768,8 +2864,6 @@ function MainApp() {
 
         // ── DELTA PAYLOAD ────────────────────────────────────────────────────────
         // Hanya kirim koleksi yang BENAR-BENAR berubah sejak sync terakhir berhasil.
-        // Ini mencegah koleksi lain (yang mungkin diubah user lain) tertimpa oleh
-        // snapshot lokal yang sudah stale. Backend hanya akan menulis sheet yang dikirim.
         const DELTA_COLS = [
           'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
           'journals', 'assessments', 'payments', 'payroll', 'calendar',
@@ -2780,8 +2874,10 @@ function MainApp() {
           try { return JSON.parse(lastSyncedSnapshotRef.current); } catch(e) { return {}; }
         })();
         const deltaPayload: Record<string, unknown> = {};
+        const dbSnapshotAtRequest: Record<string, unknown> = {};
+
         DELTA_COLS.forEach(col => {
-          // Bandingkan setiap koleksi dengan snapshot terakhir yang tersinkron
+          dbSnapshotAtRequest[col] = db[col];
           if (JSON.stringify(db[col]) !== JSON.stringify(lastSnap[col])) {
             deltaPayload[col] = db[col];
           }
@@ -2820,22 +2916,26 @@ function MainApp() {
            if (data.status === 'success') {
                // Perbarui versi lokal dengan versi terbaru dari server jika ada
                if (data.newVersion) dbVersion.current = data.newVersion;
-               // BUGFIX #3: Reset dirty flag setelah sync berhasil agar guard merge
-               // tidak terus memblokir data cloud di sesi yang sama.
-               isDbDirty.current = false;
+               
                syncBusyAttempt.current = 0;
-               // FIX DELTA: Simpan snapshot db saat ini sebagai baseline untuk delta berikutnya.
-               // Hanya diupdate saat sync BERHASIL — saat error/busy/conflict, snapshot tetap
-               // di versi lama agar koleksi yang gagal terkirim akan masuk delta berikutnya.
-               lastSyncedSnapshotRef.current = JSON.stringify({
-                 users: db.users, students: db.students, tutors: db.tutors,
-                 studentAttendance: db.studentAttendance, tutorAttendance: db.tutorAttendance,
-                 journals: db.journals, assessments: db.assessments, payments: db.payments,
-                 payroll: db.payroll, calendar: db.calendar, announcements: db.announcements,
-                 recycleBin: db.recycleBin, materials: db.materials
-               });
+               // FIX DELTA: Simpan snapshot yang DIKIRIM ke cloud, BUKAN state terbaru yang 
+               // mungkin sudah ditimpa perubahan baru selama proses fetch berlangsung.
+               lastSyncedSnapshotRef.current = JSON.stringify(dbSnapshotAtRequest);
                setIsCloudConnected(true);
                setSyncStatus('saved'); // SET INDIKATOR BERHASIL
+               
+               // BUGFIX RACE CONDITION: Hanya turunkan flag isDbDirty jika tidak ada 
+               // perubahan input baru dari user SEPANJANG proses fetch berlangsung.
+               const currentEntitiesStr = JSON.stringify({
+                   users: latestDbRef.current.users, students: latestDbRef.current.students, tutors: latestDbRef.current.tutors,
+                   studentAttendance: latestDbRef.current.studentAttendance, tutorAttendance: latestDbRef.current.tutorAttendance,
+                   journals: latestDbRef.current.journals, assessments: latestDbRef.current.assessments, payments: latestDbRef.current.payments,
+                   payroll: latestDbRef.current.payroll, calendar: latestDbRef.current.calendar, announcements: latestDbRef.current.announcements,
+                   recycleBin: latestDbRef.current.recycleBin, materials: latestDbRef.current.materials
+               });
+               if (currentEntitiesStr === JSON.stringify(dbSnapshotAtRequest)) {
+                   isDbDirty.current = false;
+               }
            } else if (data.status === 'conflict') {
                // FIX CONFLICT: Server mengirim data.payload (full db terbaru) langsung dalam
                // response conflict — kita PAKAI LANGSUNG tanpa request GET kedua yang redundan.
@@ -2868,7 +2968,7 @@ function MainApp() {
                    CONFLICT_COLS.forEach(col => {
                      const local = Array.isArray(prevDb[col]) ? prevDb[col] : [];
                      const cloud = Array.isArray(freshNormalized[col]) ? freshNormalized[col] : [];
-                     conflictMerged[col] = mergeByIds(local, cloud);
+                     conflictMerged[col] = mergeByIds(local, cloud, prevDb.recycleBin);
                    });
                    skipCloudSave.current = true;
                    lastSyncedSnapshotRef.current = null; // paksa delta penuh di sync berikutnya
@@ -2913,6 +3013,11 @@ function MainApp() {
            console.warn('AppScript Sync failed', e);
            setIsCloudConnected(false);
            setSyncStatus('error'); // SET INDIKATOR GAGAL
+           
+           // PENAMBALAN FINAL: Lepaskan pengunci retry jika putus koneksi di tengah jalan
+           syncBusyAttempt.current = 0;
+           // prevEntitiesRef dikosongkan agar ketikan selanjutnya bisa memicu trigger fetch ulang
+           prevEntitiesRef.current = null;
         });
       }, 2000); // Tunggu 2 detik setelah user berhenti mengubah data sebelum mem-fetch
     }
@@ -3065,13 +3170,11 @@ function MainApp() {
                      'announcements', 'recycleBin', 'materials'
                    ];
                    const normalizedCloud = normalizeData(cloudDb);
-                   // BUGFIX PAYMENT HILANG: Gunakan mergeByIds — gabungkan berdasarkan ID unik
-                   // agar tidak ada item yang hilang dari sisi manapun setelah login.
                    const merged: any = { ...normalizedCloud };
                    MERGE_COLS.forEach(col => {
                      const local = Array.isArray(prevDb[col]) ? prevDb[col] : [];
                      const cloud = Array.isArray(normalizedCloud[col]) ? normalizedCloud[col] : [];
-                     merged[col] = mergeByIds(local, cloud);
+                     merged[col] = mergeByIds(local, cloud, prevDb.recycleBin);
                    });
 
                    skipCloudSave.current = true;
