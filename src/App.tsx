@@ -3,7 +3,7 @@ import { Toaster, toast as sonnerToast } from 'sonner';
 import { Users, UserCheck, BookOpen, Calendar as CalendarIcon, DollarSign, FileText, Settings, LogOut, LayoutDashboard, Activity, ChartBar as BarChart3, Plus, Search, ListFilter as Filter, Download, Printer, Share2, Pencil as Edit2, UserCog, Trash2, CircleCheck as CheckCircle2, Circle as XCircle, ChevronDown, Menu, X, SquareCheck as CheckSquare, Briefcase, Bell, CircleAlert as AlertCircle, Eye, RefreshCw, Trash, ArchiveRestore, ArrowLeft, KeyRound, ShieldCheck, Shield, MessageSquare, GraduationCap, Clock, Hash, User, Award, QrCode, Quote, Cloud, CloudOff, Sun, CloudRain, CloudLightning, Droplets, Wind, Thermometer, Link as LinkIcon, MessageCircle, Check, Trophy, Target, Zap, Star, Medal, Mic, Terminal, Copy, Inbox, Database } from 'lucide-react';
 
 // Link Eksekusi Google App Script Anda
-const APPSCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwz0N2JnMPXyP1x2RdUbf2dhdWnaHnkCt93l9p7Tmxw9FoW68_AAMxPK6KG_aX_POIy/exec';
+const APPSCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzwwY5x1myZ_dyj3SF8Qqj7GT51Ub1N5dKqWHk3R8FpUCfA-acxqEVWdLj_CXdie-dW/exec';
 
 declare global {
   interface Window {
@@ -2366,21 +2366,14 @@ function MainApp() {
   // BUGFIX KRITIS: Inisialisasi dari localStorage agar delta pertama dihitung
   // dari kondisi lokal terkini, bukan dari null (yang menyebabkan seluruh DB dikirim
   // sebagai delta dan bisa menimpa data koleksi lain yang lebih baru di server).
-  const lastSyncedSnapshotRef = useRef<string | null>((() => {
-    try {
-      const saved = localStorage.getItem('ecg_db');
-      if (!saved) return null;
-      const parsed = JSON.parse(saved);
-      const SNAP_COLS = [
-        'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
-        'journals', 'assessments', 'payments', 'payroll', 'calendar',
-        'announcements', 'recycleBin', 'materials'
-      ];
-      const snap: Record<string, unknown> = {};
-      SNAP_COLS.forEach(col => { snap[col] = parsed[col] ?? []; });
-      return JSON.stringify(snap);
-    } catch { return null; }
-  })());
+  // FIX BUG #3 & #4: Inisialisasi null (bukan dari localStorage).
+  // Masalah lama: jika sync sesi sebelumnya gagal, data sudah ada di localStorage
+  // tapi TIDAK di cloud. Karena lastSyncedSnapshotRef diinit dari localStorage,
+  // delta computation menganggap data "sudah tersinkron" padahal belum — sehingga
+  // payment/jurnal/absensi tidak pernah dikirim ulang ke cloud di sesi berikutnya.
+  // Dengan null: sesi baru SELALU kirim full payload pertama kali → data lama yang
+  // gagal sync dari sesi sebelumnya dijamin masuk ke cloud.
+  const lastSyncedSnapshotRef = useRef<string | null>(null);
   // NEW: Ref untuk mencegah infinite loop saat proses exit browser
   const isExiting = useRef(false);
 
@@ -2436,10 +2429,28 @@ function MainApp() {
 
       const cloudDb = data.payload || data.state_data || data;
       if (cloudDb && Array.isArray(cloudDb.users)) {
-        const mergedData = normalizeData(cloudDb);
-        setDb(mergedData);
-        isDbDirty.current = false; // reset dirty flag
-        
+        // FIX BUG #2: refreshBeforeEdit HARUS merge, bukan replace.
+        // Masalah lama: setDb(normalizeData(cloudDb)) menimpa state lokal sepenuhnya —
+        // perubahan lokal yang belum tersinkron (nama yang baru diubah, payment baru diinput)
+        // HILANG jika user klik tombol Sync/Refresh.
+        const freshNormalized = normalizeData(cloudDb);
+        const REFRESH_COLS = [
+          'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
+          'journals', 'assessments', 'payments', 'payroll', 'calendar',
+          'announcements', 'recycleBin', 'materials'
+        ];
+        setDb(prevDb => {
+          const merged: any = { ...freshNormalized };
+          REFRESH_COLS.forEach(col => {
+            const local = Array.isArray(prevDb[col]) ? prevDb[col] : [];
+            const cloud = Array.isArray(freshNormalized[col]) ? freshNormalized[col] : [];
+            merged[col] = mergeByIds(local, cloud, prevDb.recycleBin);
+          });
+          skipCloudSave.current = true;
+          localStorage.setItem('ecg_db', JSON.stringify(merged));
+          return merged;
+        });
+        isDbDirty.current = false;
         setLogs({
           auditLogs: Array.isArray(cloudDb.auditLogs) ? cloudDb.auditLogs : [],
           debugLogs: Array.isArray(cloudDb.debugLogs) ? cloudDb.debugLogs : []
@@ -3052,8 +3063,12 @@ function MainApp() {
       `Are you sure you want to delete ${itemName || 'this record'}? It will be moved to the Recycle Bin.`,
       () => {
         const item = db[collection].find((x) => x.id === id);
+        // FIX BUG #1: binItem HARUS punya field 'id' agar mergeByIds tidak memfilternya
+        // (isInvalid() mengembalikan true jika !item.id — binItem lama hanya pakai 'binId')
+        const binId = `BIN-${Date.now()}`;
         const binItem = {
-          binId: `BIN-${Date.now()}`,
+          id: binId,          // ← primary key untuk mergeByIds
+          binId: binId,       // dipertahankan untuk kompatibilitas UI (restore/delete Recycle Bin)
           originalCollection: collection,
           deletedAt: getLocalTimestamp(),
           data: item,
@@ -3892,7 +3907,8 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
     // Simpan langsung dalam format internasional (628...) agar siap dipakai untuk link wa.me tanpa konversi lagi.
     // Format ini tidak diawali angka 0, jadi otomatis aman dari masalah auto-konversi angka di Google Sheets.
     const finalWa = normalizeWhatsapp(formData.whatsapp);
-    const rec = { ...formData, whatsapp: finalWa, id: formData.id || generateId('STU', 'students') };
+    // FIX BUG #2: tambah updatedAt agar LWW di mergeByIds tahu versi lokal lebih baru dari cloud
+    const rec = { ...formData, whatsapp: finalWa, id: formData.id || generateId('STU', 'students'), updatedAt: getLocalTimestamp() };
     setDb((prev) => ({ ...prev, students: formData.id ? prev.students.map((s) => (s.id === formData.id ? rec : s)) : [...prev.students, rec] }));
     showToast('Student saved');
     setIsAdding(false);
@@ -4145,7 +4161,8 @@ function StudentAttendanceModule({ db, setDb, showToast, softDelete, user, gener
          studentId, 
          studentName: student.name, 
          class: student.class, 
-         status 
+         status,
+         timestamp: getLocalTimestamp(), // FIX BUG #4: diperlukan untuk LWW yang benar di mergeByIds
       };
     });
     setDb((prev) => ({ ...prev, studentAttendance: [...prev.studentAttendance, ...newRecords] }));
@@ -4780,7 +4797,8 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
       date: getTodayDateLocal(),
       time: timeStr,
       method: method,
-      status: 'Paid'
+      status: 'Paid',
+      timestamp: getLocalTimestamp(), // FIX BUG #3: diperlukan untuk LWW yang benar di mergeByIds
     };
     // BUGFIX PAYMENT HILANG: Simpan payment baru ke localStorage SEGERA sebelum
     // sync debounce (2 detik) selesai, agar jika tab ditutup/browser crash,
@@ -6297,7 +6315,8 @@ function JournalsModule({ db, setDb, user, showToast, generateId, softDelete }) 
 
   const handleSave = (e) => {
     e.preventDefault();
-    const rec = { ...formData, id: formData.id || generateId('JRN', 'journals'), tutorName: user.name };
+    // FIX BUG #4: tambah timestamp untuk LWW yang benar di mergeByIds
+    const rec = { ...formData, id: formData.id || generateId('JRN', 'journals'), tutorName: user.name, timestamp: getLocalTimestamp() };
     setDb(p => ({ ...p, journals: formData.id ? p.journals.map(j => j.id === formData.id ? rec : j) : [...p.journals, rec] }));
     showToast(formData.id ? 'Journal updated' : 'Journal saved');
     setIsAdding(false);
