@@ -111,6 +111,27 @@ const normalizeTimestamp = (raw) => {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
 };
 
+// BUG FIX #9: Shared helper — merges prevDb with a normalized cloudDb.
+// Previously this logic was copy-pasted 3 times (startup, login, refreshBeforeEdit).
+// Now all three call this single function to stay in sync with any future changes.
+const MERGE_ALL_COLS = [
+  'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
+  'journals', 'assessments', 'payments', 'payroll', 'calendar',
+  'announcements', 'recycleBin', 'materials'
+];
+const mergeCloudData = (prevDb: any, normalizedCloud: any): any => {
+  const localBin = Array.isArray(prevDb.recycleBin) ? prevDb.recycleBin : [];
+  const cloudBin = Array.isArray(normalizedCloud.recycleBin) ? normalizedCloud.recycleBin : [];
+  const combinedBin = mergeByIds(localBin, cloudBin, []);
+  const merged: any = { ...normalizedCloud, recycleBin: combinedBin };
+  MERGE_ALL_COLS.filter(col => col !== 'recycleBin').forEach(col => {
+    const local = Array.isArray(prevDb[col]) ? prevDb[col] : [];
+    const cloud = Array.isArray(normalizedCloud[col]) ? normalizedCloud[col] : [];
+    merged[col] = mergeByIds(local, cloud, combinedBin);
+  });
+  return merged;
+};
+
 // BUGFIX LWW, ORPHAN & PURGE: Merge dua array berdasarkan field 'id' unik dengan Last Write Wins.
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -119,10 +140,15 @@ const mergeByIds = (local: any[], cloud: any[], recycleBin: any[] = []): any[] =
   const cloudArr = Array.isArray(cloud) ? cloud : [];
   
   // 1. Auto-Purge: Hanya baca item tong sampah yang usianya di bawah 30 Hari
+  // BUGFIX KRITIS (SISWA MUNCUL KEMBALI): Gunakan `isNaN(delTime) || ...` agar
+  // bin item dengan deletedAt yang gagal di-parse (reformatted oleh GAS/Sheets)
+  // TETAP masuk ke activeBin dan binSet. Logika ini konsisten dengan normalizeData.
+  // Versi lama `!isNaN(delTime) && ...` membuat bin item ber-deletedAt NaN dibuang
+  // dari activeBin → binSet kosong → student tidak difilter → muncul kembali di cloud.
   const activeBin = recycleBin.filter(b => {
     if (!b.deletedAt) return true;
     const delTime = new Date(String(b.deletedAt).replace(' ', 'T')).getTime(); // Safe parsing
-    return !isNaN(delTime) && (Date.now() - delTime < THIRTY_DAYS_MS);
+    return isNaN(delTime) || (Date.now() - delTime < THIRTY_DAYS_MS);
   });
   const binSet = new Set(activeBin.map((b: any) => String(b.data?.id)).filter(Boolean));
   
@@ -166,9 +192,12 @@ const mergeByIds = (local: any[], cloud: any[], recycleBin: any[] = []): any[] =
                  const exSub = mergedSubs.get(String(s.studentId));
                  if (exSub) {
                      // LEVEL 3 DEEP MERGE: GABUNGKAN KOMENTAR (REPLIES) GURU & SISWA
+                     // FIX #10: Key harus unik — tambahkan 32-char hash dari text agar
+                     // dua reply di menit yang sama dari orang yang sama tidak saling menimpa.
+                     const replyKey = (r) => `${r.date}|${r.senderName}|${String(r.text || '').slice(0, 32)}`;
                      const mergedReplies = new Map();
-                     (exSub.replies || []).forEach(r => mergedReplies.set(r.date + r.senderName, r));
-                     (s.replies || []).forEach(r => mergedReplies.set(r.date + r.senderName, r));
+                     (exSub.replies || []).forEach(r => mergedReplies.set(replyKey(r), r));
+                     (s.replies || []).forEach(r => mergedReplies.set(replyKey(r), r));
                      
                      const timeS = parseTime(s);
                      const timeEx = parseTime(exSub);
@@ -192,6 +221,24 @@ const mergeByIds = (local: any[], cloud: any[], recycleBin: any[] = []): any[] =
          if (timeCloud > timeLocal && timeCloud > 0) {
              // Pastikan hasil deep merge (tugas siswa) tetap selamat masuk ke versi Cloud
              if (item.submissions) existing.submissions = item.submissions;
+             // BUGFIX SESSION OVERRIDE: Field-field "additive" yang hanya ada di lokal
+             // (mis. sessionOverride, bonusExp, speakingChallengeCompletedCount) wajib
+             // dipertahankan meski cloud menang LWW — cloud bisa saja versi lama yang
+             // belum punya field ini, sehingga full-replace akan menghapusnya diam-diam.
+             // FIX #11: PRESERVE_LOCAL_FIELDS — kondisi `existing[field] === undefined`
+             // terlalu ketat. Cloud bisa punya 'Default' atau 0 (falsy) yang berarti
+             // field itu belum pernah diset secara meaningful — lokal yang sudah diset
+             // valid harus menang. Periksa juga nilai 'Default' dan 0 sebagai "not set".
+             const PRESERVE_LOCAL_FIELDS = ['sessionOverride', 'bonusExp', 'speakingChallengeCompletedCount', 'lastSpeakingChallengeDate', 'teacherComment'];
+             PRESERVE_LOCAL_FIELDS.forEach(field => {
+               const localVal = item[field];
+               const cloudVal = existing[field];
+               const localIsSet = localVal !== undefined && localVal !== null && localVal !== 'Default';
+               const cloudIsUnset = cloudVal === undefined || cloudVal === null || cloudVal === 'Default';
+               if (localIsSet && cloudIsUnset) {
+                 existing[field] = localVal;
+               }
+             });
              return;
          }
       }
@@ -341,7 +388,10 @@ const generateAutoComment = (student, attRate, avgScore, assessments) => {
   let comment = "";
 
   if (isKids) {
-       if (avgScore >= 85 || avgScore === 0) {
+       // BUGFIX: avgScore === 0 berarti belum ada data nilai, jangan masuk branch "Excellent"
+       if (avgScore === 0) {
+           comment = `${name} baru saja bergabung dan sedang dalam proses adaptasi. Kami akan terus memantau perkembangannya dengan penuh semangat!`;
+       } else if (avgScore >= 85) {
            const intros = [
                `${name} sangat ceria dan antusias dalam mengikuti kegiatan kelas. `,
                `${name} menunjukkan semangat belajar yang luar biasa dan selalu aktif berpartisipasi. `,
@@ -376,7 +426,10 @@ const generateAutoComment = (student, attRate, avgScore, assessments) => {
            comment = pick(intros) + improvements + pick(closings);
        }
   } else {
-       if (avgScore >= 85 || avgScore === 0) {
+       // BUGFIX: avgScore === 0 berarti belum ada data nilai, jangan masuk branch "Excellent"
+       if (avgScore === 0) {
+           comment = `${name} baru bergabung dan kami sangat antusias menyambut kehadiran beliau. Data penilaian akan tersedia setelah mengikuti sesi evaluasi pertama.`;
+       } else if (avgScore >= 85) {
            const intros = [
                `Proses belajar ${name} menunjukkan hasil yang sangat memuaskan, terlihat dari partisipasi aktif di kelas. `,
                `Kami sangat bangga dengan pencapaian akademik ${name} sejauh ini yang terus konsisten. `,
@@ -565,12 +618,35 @@ const Badge = ({ status }) => {
   );
 };
 
-const NewBadge = ({ isNew }) => {
-  if (isNew !== 'New') return null;
+const NewBadge = ({ isNew, billingStartMonth = null }: { isNew?: string, billingStartMonth?: string | null }) => {
+  // Helper: cek apakah billing belum dimulai di bulan berjalan
+  const isBillingPending = (() => {
+    if (!billingStartMonth) return false;
+    const [bYear, bMonth] = billingStartMonth.split('-').map(Number);
+    if (!bYear || !bMonth) return false;
+    const now = new Date();
+    const nowYear = now.getFullYear();
+    const nowMonth = now.getMonth() + 1;
+    // Pending jika bulan berjalan masih sebelum billingStartMonth
+    return (nowYear < bYear) || (nowYear === bYear && nowMonth < bMonth);
+  })();
+
   return (
-    <span className="ml-2 px-1.5 py-0.5 bg-pink-500/20 text-pink-400 border border-pink-500/30 rounded text-[11px] font-bold uppercase tracking-widest shadow-[0_0_10px_rgba(236,72,153,0.2)] align-middle shrink-0">
-      NEW
-    </span>
+    <>
+      {isNew === 'New' && (
+        <span className="ml-2 px-1.5 py-0.5 bg-pink-500/20 text-pink-400 border border-pink-500/30 rounded text-[11px] font-bold uppercase tracking-widest shadow-[0_0_10px_rgba(236,72,153,0.2)] align-middle shrink-0">
+          NEW
+        </span>
+      )}
+      {isBillingPending && (
+        <span
+          title={`Mulai tagih: ${billingStartMonth}`}
+          className="ml-2 px-1.5 py-0.5 bg-amber-500/20 text-amber-400 border border-amber-500/30 rounded text-[11px] font-bold uppercase tracking-widest shadow-[0_0_10px_rgba(245,158,11,0.2)] align-middle shrink-0 whitespace-nowrap"
+        >
+          PENDING BILLING
+        </span>
+      )}
+    </>
   );
 };
 
@@ -1100,13 +1176,19 @@ const GreetingCard = ({ userName, children, isCloudConnected, language = 'en' }:
 };
 
 // KOMPONEN BARU: Radar Chart (Spider Web) Generator Tanpa Library Eksternal
+// FIX #15: Generalize label positions agar tidak crash jika data.length !== 4
 const RadarChart = ({ data, theme = 'dark' }: any) => {
+  // Guard: butuh minimal 3 titik untuk membentuk polygon bermakna
+  if (!Array.isArray(data) || data.length < 3) return null;
+
   const centerX = 50;
   const centerY = 50;
   const maxRadius = 35; // Ruang ekstra untuk teks label
+  const n = data.length;
 
+  // Distribusi sudut generik: titik pertama selalu di atas (- π/2)
   const getCoordinates = (value, index) => {
-    const angle = (Math.PI / 2) * index - Math.PI / 2; // Mulai dari poros atas
+    const angle = (2 * Math.PI / n) * index - Math.PI / 2;
     const radius = ((value || 0) / 100) * maxRadius;
     return {
       x: centerX + radius * Math.cos(angle),
@@ -1114,8 +1196,30 @@ const RadarChart = ({ data, theme = 'dark' }: any) => {
     };
   };
 
+  // Titik label sedikit lebih jauh dari polygon agar tidak overlap
+  const getLabelCoords = (index) => {
+    const angle = (2 * Math.PI / n) * index - Math.PI / 2;
+    const r = maxRadius + 8;
+    return { x: centerX + r * Math.cos(angle), y: centerY + r * Math.sin(angle) };
+  };
+
+  const getLabelAnchor = (index) => {
+    const angle = (2 * Math.PI / n) * index - Math.PI / 2;
+    const cosA = Math.cos(angle);
+    if (cosA > 0.3) return 'start';
+    if (cosA < -0.3) return 'end';
+    return 'middle';
+  };
+
   const points = data.map((d: any, i: number) => getCoordinates(d.value || 0, i));
   const polygonPoints = points.map((p: any) => `${p.x},${p.y}`).join(' ');
+
+  // Grid polygon generik (n sisi)
+  const gridPolygonPoints = (r: number) =>
+    Array.from({ length: n }, (_, i) => {
+      const angle = (2 * Math.PI / n) * i - Math.PI / 2;
+      return `${centerX + r * Math.cos(angle)},${centerY + r * Math.sin(angle)}`;
+    }).join(' ');
 
   const strokeColor = theme === 'dark' ? '#00D4FF' : '#3B82F6';
   const fillColor = theme === 'dark' ? 'rgba(0, 212, 255, 0.2)' : 'rgba(59, 130, 246, 0.15)';
@@ -1131,7 +1235,7 @@ const RadarChart = ({ data, theme = 'dark' }: any) => {
         return (
           <polygon
             key={val}
-            points={`${centerX},${centerY - r} ${centerX + r},${centerY} ${centerX},${centerY + r} ${centerX - r},${centerY}`}
+            points={gridPolygonPoints(r)}
             fill="none"
             stroke={gridColor}
             strokeWidth="0.5"
@@ -1139,9 +1243,19 @@ const RadarChart = ({ data, theme = 'dark' }: any) => {
           />
         );
       })}
-      {/* Garis Sumbu Silang */}
-      <line x1={centerX} y1={centerY - maxRadius} x2={centerX} y2={centerY + maxRadius} stroke={gridColor} strokeWidth="0.5" />
-      <line x1={centerX - maxRadius} y1={centerY} x2={centerX + maxRadius} y2={centerY} stroke={gridColor} strokeWidth="0.5" />
+      {/* Garis Sumbu dari Pusat ke Tiap Sudut */}
+      {Array.from({ length: n }, (_, i) => {
+        const angle = (2 * Math.PI / n) * i - Math.PI / 2;
+        return (
+          <line
+            key={i}
+            x1={centerX} y1={centerY}
+            x2={centerX + maxRadius * Math.cos(angle)}
+            y2={centerY + maxRadius * Math.sin(angle)}
+            stroke={gridColor} strokeWidth="0.5"
+          />
+        );
+      })}
 
       {/* Polygon Data Utama */}
       <polygon points={polygonPoints} fill={fillColor} stroke={strokeColor} strokeWidth="1.5" className="transition-all duration-1000 ease-out" />
@@ -1149,18 +1263,17 @@ const RadarChart = ({ data, theme = 'dark' }: any) => {
       {/* Titik Sudut */}
       {points.map((p: any, i: number) => <circle key={i} cx={p.x} cy={p.y} r="1.5" fill={strokeColor} />)}
 
-      {/* Teks Label (Pilar) */}
-      <text x={centerX} y={centerY - maxRadius - 3} textAnchor="middle" fontSize="4.5" fill={textColor} fontWeight="bold">{data[0].label}</text>
-      <text x={centerX} y={centerY - maxRadius + 4} textAnchor="middle" fontSize="4" fill={valueColor} fontWeight="900">{data[0].value}</text>
-
-      <text x={centerX + maxRadius + 3} y={centerY - 1} textAnchor="start" fontSize="4.5" fill={textColor} fontWeight="bold">{data[1].label}</text>
-      <text x={centerX + maxRadius - 3} y={centerY + 2.5} textAnchor="start" fontSize="4" fill={valueColor} fontWeight="900">{data[1].value}</text>
-
-      <text x={centerX} y={centerY + maxRadius + 6} textAnchor="middle" fontSize="4.5" fill={textColor} fontWeight="bold">{data[2].label}</text>
-      <text x={centerX} y={centerY + maxRadius - 2} textAnchor="middle" fontSize="4" fill={valueColor} fontWeight="900">{data[2].value}</text>
-
-      <text x={centerX - maxRadius - 3} y={centerY - 1} textAnchor="end" fontSize="4.5" fill={textColor} fontWeight="bold">{data[3].label}</text>
-      <text x={centerX - maxRadius + 3} y={centerY + 2.5} textAnchor="end" fontSize="4" fill={valueColor} fontWeight="900">{data[3].value}</text>
+      {/* Teks Label Generik (bekerja untuk 3, 4, atau lebih titik) */}
+      {data.map((d: any, i: number) => {
+        const lc = getLabelCoords(i);
+        const anchor = getLabelAnchor(i);
+        return (
+          <g key={i}>
+            <text x={lc.x} y={lc.y - 1.5} textAnchor={anchor} fontSize="4.5" fill={textColor} fontWeight="bold">{d.label}</text>
+            <text x={lc.x} y={lc.y + 4} textAnchor={anchor} fontSize="4" fill={valueColor} fontWeight="900">{d.value}</text>
+          </g>
+        );
+      })}
     </svg>
   );
 };
@@ -1206,7 +1319,15 @@ const StudentDashboard = ({ db, user, setActiveTab, today, isCloudConnected, lan
   const studentPlan = studentRecord.paymentPlan || 'Monthly';
   let paymentTarget = 0;
   if (studentPlan === 'Monthly') {
-      paymentTarget = db.calendar.filter(c => c.date.startsWith(currentMonthPrefix) && (c.sessionGroup || c.name) === mySessionGroup).length * 25000;
+      // BUG FIX #5: Use fuzzy session match (consistent with other session comparisons in StudentDashboard)
+      // to avoid paymentTarget being 0 when session strings have minor format differences.
+      const _sessionMatchPayment = (cGroup, sGroup) => {
+        if (!cGroup || !sGroup) return false;
+        if (cGroup === sGroup) return true;
+        const a = cGroup.toLowerCase(), b = sGroup.toLowerCase();
+        return a.includes(b) || b.includes(a);
+      };
+      paymentTarget = db.calendar.filter(c => c.date.startsWith(currentMonthPrefix) && _sessionMatchPayment(c.sessionGroup || c.name, mySessionGroup)).length * 25000;
   } else {
       paymentTarget = db.studentAttendance.filter(a => a.studentId === user.studentId && a.date.startsWith(currentMonthPrefix) && a.status === 'Present').length * 25000;
   }
@@ -1227,8 +1348,14 @@ const StudentDashboard = ({ db, user, setActiveTab, today, isCloudConnected, lan
   const avgScore = latestAss ? latestAss.average : 0;
   const currentGrade = latestAss ? latestAss.grade : '-';
 
+  // BUGFIX: Gunakan fuzzy match agar jadwal tetap muncul meski ada perbedaan format nama sesi kecil
   const upcomingClasses = db.calendar
-      .filter(c => (c.date || '') >= today && (c.sessionGroup || c.name) === mySessionGroup)
+      .filter(c => {
+        if ((c.date || '') < today) return false;
+        const cGroup = (c.sessionGroup || c.name || '').toLowerCase();
+        const sGroup = (mySessionGroup || '').toLowerCase();
+        return cGroup === sGroup || cGroup.includes(sGroup) || sGroup.includes(cGroup);
+      })
       .sort((a,b) => String(a.date || '').localeCompare(String(b.date || '')))
       .slice(0, 5);
   const nextClass = upcomingClasses.length > 0 ? upcomingClasses[0] : null;
@@ -1440,6 +1567,8 @@ const AdminDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
   const activeStudents = db.students.filter(s => s.status === 'Active' || s.active === 'Active');
   
   activeStudents.forEach(s => {
+     // FREE plan: tidak masuk hitungan expected revenue sama sekali
+     if (s.paymentPlan === 'Free') return;
      const sGroup = getStudentSession(s);
      // Semua siswa (Monthly maupun Per Visit) dihitung berdasarkan jumlah jadwal bulan ini
      const scheduledCount = db.calendar.filter(c => c.date.startsWith(currentMonthPrefix) && (c.sessionGroup || c.name) === sGroup).length;
@@ -1632,7 +1761,7 @@ const AdminDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                                    <span className="font-bold text-xs whitespace-nowrap">{badge.title}</span>
                                </div>
                             </td>
-                            <td className="p-3 sm:p-4 font-bold text-white"><div className="flex items-center">{s.name} <NewBadge isNew={s.enrollmentStatus} /> <span className="text-xs text-gray-500 font-normal ml-1">({s.class})</span></div></td>
+                            <td className="p-3 sm:p-4 font-bold text-white"><div className="flex items-center">{s.name} <NewBadge isNew={s.enrollmentStatus} billingStartMonth={s.billingStartMonth || null} /> <span className="text-xs text-gray-500 font-normal ml-1">({s.class})</span></div></td>
                             <td className="p-3 sm:p-4 text-center text-gray-300 text-xs">{getStudentSession(s)}</td>
                             <td className="p-3 sm:p-4 text-center"><span className={`px-3 py-1 rounded-full text-[11px] font-semibold uppercase tracking-widest border ${lvl.bg} ${lvl.border} ${lvl.textCol}`}>{lvl.title}</span></td>
                             <td className="p-3 sm:p-4 text-right">
@@ -1651,7 +1780,7 @@ const AdminDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                                         onKeyDown={(e) => {
                                            if (e.key === 'Enter') {
                                               const val = Number(e.currentTarget.value) || 0;
-                                              setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (Number(stu.bonusExp) || 0) + val } : stu) }));
+                                              setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (Number(stu.bonusExp) || 0) + val, updatedAt: getLocalTimestamp() } : stu) }));
                                               showToast(language === 'id' ? `Berhasil menyesuaikan ${val} EXP untuk ${expModalStudent.name}` : `Successfully adjusted ${val} EXP for ${expModalStudent.name}`);
                                               setExpModalStudent(null);
                                               setExpInput('');
@@ -1663,7 +1792,7 @@ const AdminDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                                      />
                                      <button type="button" onClick={() => {
                                         const val = Number(expInput) || 0;
-                                        setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (Number(stu.bonusExp) || 0) + val } : stu) }));
+                                        setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (Number(stu.bonusExp) || 0) + val, updatedAt: getLocalTimestamp() } : stu) }));
                                         showToast(language === 'id' ? `Berhasil menyesuaikan ${val} EXP untuk ${expModalStudent.name}` : `Successfully adjusted ${val} EXP for ${expModalStudent.name}`);
                                         setExpModalStudent(null);
                                         setExpInput('');
@@ -1901,7 +2030,7 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                                    <span className="font-bold text-xs whitespace-nowrap">{badge.title}</span>
                                </div>
                             </td>
-                            <td className="p-3 sm:p-4 font-bold text-white"><div className="flex items-center">{s.name} <NewBadge isNew={s.enrollmentStatus} /> <span className="text-xs text-gray-500 font-normal ml-1">({s.class})</span></div></td>
+                            <td className="p-3 sm:p-4 font-bold text-white"><div className="flex items-center">{s.name} <NewBadge isNew={s.enrollmentStatus} billingStartMonth={s.billingStartMonth || null} /> <span className="text-xs text-gray-500 font-normal ml-1">({s.class})</span></div></td>
                             <td className="p-3 sm:p-4 text-center"><span className={`px-3 py-1 rounded-full text-[11px] font-semibold uppercase tracking-widest border ${lvl.bg} ${lvl.border} ${lvl.textCol}`}>{lvl.title}</span></td>
                             <td className="p-3 sm:p-4 text-right">
                                <div className="font-black text-[#00D4FF]">{s.exp.toLocaleString()} <span className="text-[11px] text-gray-500 font-bold">EXP</span></div>
@@ -1919,7 +2048,7 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                                         onKeyDown={(e) => {
                                            if (e.key === 'Enter') {
                                               const val = Number(e.currentTarget.value) || 0;
-                                              setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (Number(stu.bonusExp) || 0) + val } : stu) }));
+                                              setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (Number(stu.bonusExp) || 0) + val, updatedAt: getLocalTimestamp() } : stu) }));
                                               showToast(language === 'id' ? `Berhasil menyesuaikan ${val} EXP untuk ${expModalStudent.name}` : `Successfully adjusted ${val} EXP for ${expModalStudent.name}`);
                                               setExpModalStudent(null);
                                               setExpInput('');
@@ -1931,7 +2060,7 @@ const TutorDashboard = ({ db, setDb, user, setActiveTab, today, isCloudConnected
                                      />
                                      <button type="button" onClick={() => {
                                         const val = Number(expInput) || 0;
-                                        setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (Number(stu.bonusExp) || 0) + val } : stu) }));
+                                        setDb(prev => ({ ...prev, students: prev.students.map(stu => stu.id === expModalStudent.id ? { ...stu, bonusExp: (Number(stu.bonusExp) || 0) + val, updatedAt: getLocalTimestamp() } : stu) }));
                                         showToast(language === 'id' ? `Berhasil menyesuaikan ${val} EXP untuk ${expModalStudent.name}` : `Successfully adjusted ${val} EXP for ${expModalStudent.name}`);
                                         setExpModalStudent(null);
                                         setExpInput('');
@@ -1987,15 +2116,15 @@ class ErrorBoundary extends React.Component<any, any> {
             <div className="w-16 h-16 bg-red-500/10 rounded-full flex items-center justify-center mx-auto mb-4 border border-red-500/20">
               <AlertCircle size={32} className="text-red-500" />
             </div>
-            <h2 className="text-2xl font-bold text-white mb-2">Sistem Sedang Memulihkan Diri</h2>
-            <p className="text-gray-400 text-sm mb-6">Terjadi anomali data yang tidak terduga. Jangan panik, cukup muat ulang halaman untuk memulihkan sesi Anda.</p>
+            <h2 className="text-2xl font-bold text-white mb-2">System is Recovering</h2>
+            <p className="text-gray-400 text-sm mb-6">An unexpected data anomaly occurred. Don't panic — just reload the page to restore your session.</p>
             <div className="flex flex-col gap-3">
               <button onClick={() => window.location.reload()} className="bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-xl transition-all shadow-[0_0_15px_rgba(239,68,68,0.3)]">
-                Muat Ulang Aplikasi
+                Reload Application
               </button>
               {/* PERBAIKAN: Tombol Hard Reset untuk mencegah Infinite Crash Loop jika memori lokal korup */}
               <button onClick={() => { localStorage.removeItem('ecg_db'); window.location.reload(); }} className="text-xs text-gray-500 hover:text-gray-300 underline transition-colors">
-                Gagal memuat ulang? Klik untuk Hard Reset (Hapus Cache)
+                Still failing? Click to Hard Reset (Clear Cache)
               </button>
             </div>
           </div>
@@ -2434,23 +2563,18 @@ function MainApp() {
         // perubahan lokal yang belum tersinkron (nama yang baru diubah, payment baru diinput)
         // HILANG jika user klik tombol Sync/Refresh.
         const freshNormalized = normalizeData(cloudDb);
-        const REFRESH_COLS = [
-          'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
-          'journals', 'assessments', 'payments', 'payroll', 'calendar',
-          'announcements', 'recycleBin', 'materials'
-        ];
+        // BUG FIX #9: Use shared mergeCloudData helper instead of inline copy-paste
         setDb(prevDb => {
-          const merged: any = { ...freshNormalized };
-          REFRESH_COLS.forEach(col => {
-            const local = Array.isArray(prevDb[col]) ? prevDb[col] : [];
-            const cloud = Array.isArray(freshNormalized[col]) ? freshNormalized[col] : [];
-            merged[col] = mergeByIds(local, cloud, prevDb.recycleBin);
-          });
+          const merged: any = mergeCloudData(prevDb, freshNormalized);
           skipCloudSave.current = true;
           localStorage.setItem('ecg_db', JSON.stringify(merged));
           return merged;
         });
-        isDbDirty.current = false;
+        // BUGFIX (BUG 4): Jangan paksa isDbDirty = false di sini.
+        // Jika user sudah input data (payment, absensi, dll) sebelum klik Refresh,
+        // mematikan flag ini akan membuat sync debounce yang pending dibatalkan
+        // oleh guard di useEffect → data lokal tidak pernah dikirim ke cloud.
+        // Flag isDbDirty akan dimatikan otomatis oleh useEffect setelah sync berhasil.
         setLogs({
           auditLogs: Array.isArray(cloudDb.auditLogs) ? cloudDb.auditLogs : [],
           debugLogs: Array.isArray(cloudDb.debugLogs) ? cloudDb.debugLogs : []
@@ -2470,7 +2594,9 @@ function MainApp() {
   // FUNGSI BARU: Pelapor Log Langsung ke Sheet
   const sendLogAction = (actionName, details, isError = false) => {
      const activeSession = sessionStorage.getItem('ecg_active_session');
-     const userName = activeSession ? JSON.parse(activeSession).name : 'SYSTEM/GUEST';
+     // BUG FIX #8: Wrap JSON.parse with try-catch — corrupted sessionStorage would crash logging
+     let userName = 'SYSTEM/GUEST';
+     try { if (activeSession) userName = JSON.parse(activeSession).name || 'SYSTEM/GUEST'; } catch(e) {}
      const token = getAuthToken();
 
      if (token) {
@@ -2761,17 +2887,8 @@ function MainApp() {
           
         if (cloudDb && Array.isArray(cloudDb.users)) {
           setDb(prevDb => {
-             // PERBAIKAN KRITIS: Mencegah Race Condition (Data Hilang Saat Log In Kembali)
-             // Guard ini hanya aktif jika user SUDAH login dan mengedit data di sesi ini.
-             // Jika belum login (startup / perangkat baru), SELALU pakai data cloud.
-             // BUGFIX #2: Hitung SEMUA koleksi (bukan hanya 5) agar data baru di
-             // calendar/assessments/payments/materials/announcements dari perangkat
-             // lain tidak terlewat oleh guard ini.
-             const getCount = (d) => Object.keys(defaultDbStructure)
-               .filter(k => k !== 'recycleBin')
-               .reduce((sum, k) => sum + (Array.isArray(d[k]) ? d[k].length : 0), 0);
-             const localCount = getCount(prevDb);
-             const cloudCount = getCount(cloudDb);
+             // BUG FIX #2: Removed unused localCount/cloudCount dead variables.
+             // Guard is purely based on isDbDirty + per-collection merge.
              const userIsLoggedIn = !!getAuthToken();
 
              // BUGFIX KRITIS (DATA HILANG): Jangan reject/accept seluruh data berdasarkan
@@ -2784,24 +2901,43 @@ function MainApp() {
                 return prevDb;
              }
 
-             const MERGE_COLS_STARTUP = [
-               'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
-               'journals', 'assessments', 'payments', 'payroll', 'calendar',
-               'announcements', 'recycleBin', 'materials'
-             ];
              const normalizedCloudStartup = normalizeData(cloudDb);
-             const mergedStartup: any = { ...normalizedCloudStartup };
-             if (userIsLoggedIn) {
-               MERGE_COLS_STARTUP.forEach(col => {
-                 const local = Array.isArray(prevDb[col]) ? prevDb[col] : [];
-                 const cloud = Array.isArray(normalizedCloudStartup[col]) ? normalizedCloudStartup[col] : [];
-                 mergedStartup[col] = mergeByIds(local, cloud, prevDb.recycleBin);
-               });
-             }
+             // BUG FIX #9: Use shared mergeCloudData helper instead of inline copy-paste
+             const mergedStartup: any = userIsLoggedIn
+               ? mergeCloudData(prevDb, normalizedCloudStartup)
+               : { ...normalizedCloudStartup };
              
+             // BUG FIX #3: Set skipCloudSave BEFORE returning from setDb callback
+             // to guarantee the flag is set before the db useEffect can fire on next render.
              skipCloudSave.current = true;
              const mergedData = mergedStartup;
              localStorage.setItem('ecg_db', JSON.stringify(mergedData));
+
+             // BUGFIX SYNC GAGAL (BUG 2): Jika lokal punya data lebih banyak dari cloud
+             // di koleksi manapun (misal payment tersimpan lokal tapi sync gagal sebelumnya),
+             // paksa isDbDirty = true agar sync ulang terjadi di sesi ini.
+             // Tanpa ini, payment lokal tidak pernah di-push ke cloud setelah reload.
+             if (userIsLoggedIn) {
+               // FIX #9a (localHasExtra FALSE POSITIVE): Cek apakah ada ID lokal yang TIDAK ADA
+               // di cloud — bukan sekadar membandingkan panjang array. Perbandingan panjang
+               // salah: jika cloud +1 (dari device lain) tapi lokal +1 (offline), panjang sama
+               // padahal keduanya punya data berbeda yang perlu disinkronkan.
+               const MERGE_COLS_CHECK = [
+                 'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
+                 'journals', 'assessments', 'payments', 'payroll', 'calendar',
+                 'announcements', 'materials'
+               ];
+               const localHasExtra = MERGE_COLS_CHECK.some(col => {
+                 const localArr = Array.isArray(prevDb[col]) ? prevDb[col] : [];
+                 const cloudIds = new Set((Array.isArray(normalizedCloudStartup[col]) ? normalizedCloudStartup[col] : []).map(i => String(i.id)));
+                 return localArr.some(item => item?.id && !cloudIds.has(String(item.id)));
+               });
+               if (localHasExtra) {
+                 console.warn('Local has IDs not in cloud — forcing sync (Bug 9 fix)');
+                 isDbDirty.current = true;
+               }
+             }
+
              // FIX: Muat logs dari cloud ke state terpisah (bukan ke db)
              setLogs({
                auditLogs: Array.isArray(cloudDb.auditLogs) ? cloudDb.auditLogs : [],
@@ -2887,10 +3023,14 @@ function MainApp() {
         const deltaPayload: Record<string, unknown> = {};
         const dbSnapshotAtRequest: Record<string, unknown> = {};
 
+        // FIX #1 (STALE CLOSURE): Gunakan latestDbRef.current, BUKAN `db` dari closure,
+        // agar data yang dikirim ke cloud adalah versi TERBARU saat timer meletus —
+        // bukan versi 2 detik lalu saat useEffect pertama kali berjalan.
+        const latestDb = latestDbRef.current;
         DELTA_COLS.forEach(col => {
-          dbSnapshotAtRequest[col] = db[col];
-          if (JSON.stringify(db[col]) !== JSON.stringify(lastSnap[col])) {
-            deltaPayload[col] = db[col];
+          dbSnapshotAtRequest[col] = latestDb[col];
+          if (JSON.stringify(latestDb[col]) !== JSON.stringify(lastSnap[col])) {
+            deltaPayload[col] = latestDb[col];
           }
         });
         // Log selalu disertakan (tidak mempengaruhi data utama)
@@ -2935,8 +3075,10 @@ function MainApp() {
                setIsCloudConnected(true);
                setSyncStatus('saved'); // SET INDIKATOR BERHASIL
                
-               // BUGFIX RACE CONDITION: Hanya turunkan flag isDbDirty jika tidak ada 
-               // perubahan input baru dari user SEPANJANG proses fetch berlangsung.
+               // FIX #2 (isDbDirty TIDAK PERNAH RESET): Bandingkan latestDb (state terkini)
+               // dengan dbSnapshotAtRequest (data yang baru saja berhasil dikirim).
+               // Jika sama → tidak ada perubahan baru selama fetch berlangsung → aman di-reset.
+               // Jika berbeda → ada input baru dari user → biarkan dirty agar sync ulang terjadi.
                const currentEntitiesStr = JSON.stringify({
                    users: latestDbRef.current.users, students: latestDbRef.current.students, tutors: latestDbRef.current.tutors,
                    studentAttendance: latestDbRef.current.studentAttendance, tutorAttendance: latestDbRef.current.tutorAttendance,
@@ -2944,8 +3086,14 @@ function MainApp() {
                    payroll: latestDbRef.current.payroll, calendar: latestDbRef.current.calendar, announcements: latestDbRef.current.announcements,
                    recycleBin: latestDbRef.current.recycleBin, materials: latestDbRef.current.materials
                });
-               if (currentEntitiesStr === JSON.stringify(dbSnapshotAtRequest)) {
+               const snapshotStr = JSON.stringify(dbSnapshotAtRequest);
+               if (currentEntitiesStr === snapshotStr) {
                    isDbDirty.current = false;
+               }
+               // Jika masih dirty (ada perubahan baru), trigger sync ulang secara eksplisit
+               // dengan cara yang andal (bukan setDb shallow copy)
+               if (isDbDirty.current) {
+                   prevEntitiesRef.current = null;
                }
            } else if (data.status === 'conflict') {
                // FIX CONFLICT: Server mengirim data.payload (full db terbaru) langsung dalam
@@ -2969,52 +3117,45 @@ function MainApp() {
                  // JANGAN pernah setDb(merged) murni dari cloud — payment/data lokal yang
                  // belum tersinkron akan hilang. Baik dirty maupun tidak, gunakan mergeByIds
                  // agar data dari kedua sisi tetap ada. Lokal diutamakan untuk item yang sama.
-                 const CONFLICT_COLS = [
-                   'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
-                   'journals', 'assessments', 'payments', 'payroll', 'calendar',
-                   'announcements', 'recycleBin', 'materials'
-                 ];
+                 // BUG FIX #9: Use shared mergeCloudData helper instead of inline copy-paste
                  setDb(prevDb => {
-                   const conflictMerged: any = { ...freshNormalized };
-                   CONFLICT_COLS.forEach(col => {
-                     const local = Array.isArray(prevDb[col]) ? prevDb[col] : [];
-                     const cloud = Array.isArray(freshNormalized[col]) ? freshNormalized[col] : [];
-                     conflictMerged[col] = mergeByIds(local, cloud, prevDb.recycleBin);
-                   });
+                   const conflictMerged: any = mergeCloudData(prevDb, freshNormalized);
                    skipCloudSave.current = true;
                    lastSyncedSnapshotRef.current = null; // paksa delta penuh di sync berikutnya
                    localStorage.setItem('ecg_db', JSON.stringify(conflictMerged));
                    return conflictMerged;
                  });
-                 // Setelah merge, paksa retry sync agar data lokal yang di-merge terkirim ke server
+                 // FIX #3 (CONFLICT RETRY): Paksa re-sync dengan cara yang andal.
+                 // setDb({...prev}) tidak cukup karena guard prevEntitiesRef bisa memblokir.
+                 // Solusi: null-kan prevEntitiesRef DAN tandai dirty, lalu tunggu React
+                 // re-render alami dari setDb merge di atas — tidak perlu setTimeout trigger.
                  isDbDirty.current = true;
                  prevEntitiesRef.current = null;
-                 setTimeout(() => {
-                   setDb(prev => ({ ...prev })); // trigger useEffect sync
-                 }, 500);
+                 // skipCloudSave sudah true dari dalam setDb di atas; reset agar useEffect
+                 // sync bisa jalan di render berikutnya setelah state settle.
+                 setTimeout(() => { skipCloudSave.current = false; }, 100);
                  setSyncStatus('saved');
                  setIsCloudConnected(true);
                } else {
                  setSyncStatus('error');
                }
            } else if (data.status === 'busy') {
-               // FIX 5: Busy — auto-retry dengan exponential backoff (2s, 4s, 8s).
-               // Tanpa ini, data tidak pernah tersinkron jika user tidak edit apapun lagi.
-               // BUGFIX #6: Gunakan syncBusyAttempt ref (bukan window._syncBusyAttempt)
-               // agar tidak terjadi race condition jika app dibuka di 2 tab sekaligus.
+               // FIX #8 (BUSY BACKOFF COUNTER SELALU RESET): Increment DULU, SIMPAN nilai,
+               // baru buat setTimeout. Jangan reset di dalam setTimeout karena itu
+               // membuat attempt selalu 1 dan delay selalu 2s.
                syncBusyAttempt.current = syncBusyAttempt.current + 1;
                const attempt = syncBusyAttempt.current;
                const delay = Math.min(2000 * Math.pow(2, attempt - 1), 16000); // 2s, 4s, 8s, max 16s
                console.warn(`AppScript busy — retry #${attempt} dalam ${delay/1000}s`);
                setSyncStatus('syncing');
                setTimeout(() => {
-                 syncBusyAttempt.current = 0; // reset counter setelah retry
-                 isDbDirty.current = true;    // paksa useEffect db untuk trigger sync ulang
-                 // BUGFIX BUSY-RETRY: Null-kan prevEntitiesRef agar guard equality check
-                 // tidak memblokir sync. Tanpa ini, retry selalu dianggap "no change" dan
-                 // data yang pending tidak pernah terkirim ke server.
+                 // Reset counter HANYA setelah backoff selesai (bukan sebelum delay dihitung)
+                 if (syncBusyAttempt.current >= attempt) syncBusyAttempt.current = 0;
+                 isDbDirty.current = true;
+                 // Null-kan prevEntitiesRef agar guard equality check tidak memblokir sync
                  prevEntitiesRef.current = null;
-                 setDb(prev => ({ ...prev })); // trigger useEffect dengan shallow copy
+                 // Tidak perlu setDb({...prev}) — prevEntitiesRef=null sudah cukup memicu
+                 // sync di render berikutnya ketika ada perubahan db apapun.
                }, delay);
            } else {
                throw new Error(data.message || 'Sync error');
@@ -3100,9 +3241,14 @@ function MainApp() {
 
     let newId;
     let isUnique = false;
+    // FIX #16: Batasi iterasi maksimal 100x untuk mencegah infinite loop jika
+    // prefix space terlalu penuh. Jika melebihi batas, tambahkan timestamp sebagai suffix.
+    const MAX_ATTEMPTS = 100;
+    let attempt = 0;
 
     // Loop pencegah collision: Memastikan ID benar-benar unik di seluruh database
-    while (!isUnique) {
+    while (!isUnique && attempt < MAX_ATTEMPTS) {
+      attempt++;
       newId = `${prefix}-${generateRandomPart()}`;
       
       // Periksa apakah ID sudah terpakai di koleksi data aktif
@@ -3116,6 +3262,11 @@ function MainApp() {
       if (!existsInDb && !existsInBin) {
         isUnique = true;
       }
+    }
+
+    // Fallback jika semua percobaan gagal (sangat jarang): tambahkan timestamp unik
+    if (!isUnique) {
+      newId = `${prefix}-${generateRandomPart()}-${Date.now().toString(36).toUpperCase()}`;
     }
 
     return newId;
@@ -3148,7 +3299,7 @@ function MainApp() {
           const normalizedUser = cleanUser; // sudah lowercase dari handleLogin
           const existing = prev.filter(acc => String(acc.username || '').toLowerCase() !== normalizedUser);
           // SECURITY FIX: Simpan token saja, BUKAN password di savedAccounts
-          const sessionToken = sessionStorage.getItem('ecg_session_token') || '';
+          // FIX #4b: Gunakan sessionToken dari parameter fungsi, bukan baca ulang sessionStorage
           const newAccounts = [...existing, { username: normalizedUser, name: userObj.name, role: userObj.role, lastToken: sessionToken }];
           localStorage.setItem('ecg_saved_accounts', JSON.stringify(newAccounts));
           return newAccounts;
@@ -3158,6 +3309,8 @@ function MainApp() {
        showToast(language === 'id' ? `Selamat datang kembali, ${userObj.name}` : `Welcome back, ${userObj.name}`);
 
        // TRIGGER AUTO-SYNC KE CLOUD SETELAH LOGIN BERHASIL (Mengatasi selalu Offline Mode saat login)
+       // FIX #4 (TOKEN KOSONG): Gunakan parameter `sessionToken` dari argumen fungsi ini —
+       // BUKAN sessionStorage.getItem() yang mungkin belum ter-commit saat baris ini dieksekusi.
        setSyncStatus('syncing');
        fetch(`${APPSCRIPT_URL}?token=${sessionToken}`)
           .then(res => res.json())
@@ -3166,35 +3319,38 @@ function MainApp() {
              if (cloudDb && Array.isArray(cloudDb.users)) {
                 if (data._dbVersion) dbVersion.current = data._dbVersion;
                 setDb(prevDb => {
-                   // BUGFIX #2: Hitung semua koleksi untuk perbandingan yang akurat
-                   const getCount = (d) => Object.keys(defaultDbStructure)
-                     .filter(k => k !== 'recycleBin')
-                     .reduce((sum, k) => sum + (Array.isArray(d[k]) ? d[k].length : 0), 0);
-                   const localCount = getCount(prevDb);
-                   const cloudCount = getCount(cloudDb);
-                   
-                   // BUGFIX KRITIS (DATA HILANG): Guard total-count tidak aman —
-                   // cloud +1 payment membuat cloudCount > localCount sehingga data
-                   // cloud (yang mungkin stale di jurnal/absensi) menimpa data lokal.
-                   // Solusi: merge per-koleksi — ambil yang lebih panjang dari setiap koleksi.
+                   // BUG FIX #2: Removed unused localCount/cloudCount dead variables.
+                   // Guard is now purely based on isDbDirty — merge per-collection instead.
                    if (isDbDirty.current) return prevDb; // User sudah edit setelah login — prioritaskan lokal
 
-                   const MERGE_COLS = [
-                     'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
-                     'journals', 'assessments', 'payments', 'payroll', 'calendar',
-                     'announcements', 'recycleBin', 'materials'
-                   ];
                    const normalizedCloud = normalizeData(cloudDb);
-                   const merged: any = { ...normalizedCloud };
-                   MERGE_COLS.forEach(col => {
-                     const local = Array.isArray(prevDb[col]) ? prevDb[col] : [];
-                     const cloud = Array.isArray(normalizedCloud[col]) ? normalizedCloud[col] : [];
-                     merged[col] = mergeByIds(local, cloud, prevDb.recycleBin);
-                   });
+                   // BUG FIX #9: Use shared mergeCloudData helper instead of inline copy-paste
+                   const merged: any = mergeCloudData(prevDb, normalizedCloud);
 
+                   // BUG FIX #3: Set skipCloudSave BEFORE returning from setDb to avoid race condition
                    skipCloudSave.current = true;
                    const mergedData = merged;
                    localStorage.setItem('ecg_db', JSON.stringify(mergedData));
+
+                   // BUGFIX SYNC GAGAL (BUG 2): Jika lokal punya data lebih dari cloud
+                   // di koleksi manapun, paksa sync agar data lokal yang belum ter-push
+                   // (misalnya payment saat offline) segera dikirim ke cloud setelah login.
+                   // FIX #9b (localHasExtra LOGIN FALSE POSITIVE): Cek ID unik lokal vs cloud
+                   const MERGE_COLS_CHECK2 = [
+                     'users', 'students', 'tutors', 'studentAttendance', 'tutorAttendance',
+                     'journals', 'assessments', 'payments', 'payroll', 'calendar',
+                     'announcements', 'materials'
+                   ];
+                   const localHasExtraLogin = MERGE_COLS_CHECK2.some(col => {
+                     const localArr = Array.isArray(prevDb[col]) ? prevDb[col] : [];
+                     const cloudIds = new Set((Array.isArray(normalizedCloud[col]) ? normalizedCloud[col] : []).map(i => String(i.id)));
+                     return localArr.some(item => item?.id && !cloudIds.has(String(item.id)));
+                   });
+                   if (localHasExtraLogin) {
+                     console.warn('Login sync: local has IDs not in cloud — forcing sync (Bug 9 fix)');
+                     isDbDirty.current = true;
+                   }
+
                    setLogs({
                       auditLogs: Array.isArray(cloudDb.auditLogs) ? cloudDb.auditLogs : [],
                       debugLogs: Array.isArray(cloudDb.debugLogs) ? cloudDb.debugLogs : []
@@ -3335,7 +3491,8 @@ function MainApp() {
   const removeSavedAccount = (e, username) => {
     e.stopPropagation();
     setSavedAccounts(prev => {
-       const newAcc = prev.filter(a => a.username !== username);
+       // BUG FIX #6: Use case-insensitive comparison to handle pre-migration accounts with mixed case
+       const newAcc = prev.filter(a => String(a.username || '').toLowerCase() !== String(username || '').toLowerCase());
        localStorage.setItem('ecg_saved_accounts', JSON.stringify(newAcc));
        return newAcc;
     });
@@ -3348,7 +3505,11 @@ function MainApp() {
         const script = document.createElement('script');
         script.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
         document.body.appendChild(script);
-        await new Promise((resolve) => (script.onload = resolve));
+        // BUG FIX #7: Add onerror handler to prevent infinite hang when CDN is unreachable
+        await new Promise((resolve, reject) => {
+          script.onload = resolve;
+          script.onerror = () => reject(new Error('Failed to load html2canvas from CDN'));
+        });
       }
       const element = document.getElementById(elementId);
       const canvas = await window.html2canvas(element, { scale: 2, backgroundColor: '#ffffff', useCORS: true });
@@ -3371,7 +3532,11 @@ function MainApp() {
         const script = document.createElement('script');
         script.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
         document.body.appendChild(script);
-        await new Promise(resolve => script.onload = resolve);
+        // BUG FIX #7: Add onerror handler to prevent infinite hang when CDN is unreachable
+        await new Promise((resolve, reject) => {
+          script.onload = resolve;
+          script.onerror = () => reject(new Error('Failed to load html2canvas from CDN'));
+        });
       }
       const element = document.getElementById(elementId);
       const canvas = await window.html2canvas(element, { scale: 2, backgroundColor: '#ffffff', useCORS: true });
@@ -3443,7 +3608,13 @@ function MainApp() {
       const activeStudents = db.students.filter(s => s.status === 'Active');
       const mySessions = parseSessions(currentUser.teachingSession);
       const myStudents = activeStudents.filter(s => mySessions.includes(getStudentSession(s))).length;
-      const assessmentsDone = db.assessments.filter(a => Number(a.month) === Number(currentMonth) && String(a.year) === String(currentYear) && mySessions.includes(a.sessionGroup)).length;
+      // FIX #13: Deduplikasi studentId agar satu siswa dengan 2 record assessment
+      // tidak menggelembungkan assessmentsDone melebihi myStudents → badge negatif.
+      const assessmentsDone = new Set(
+        db.assessments
+          .filter(a => Number(a.month) === Number(currentMonth) && String(a.year) === String(currentYear) && mySessions.includes(a.sessionGroup))
+          .map(a => a.studentId)
+      ).size;
       counts.assessments = Math.max(0, myStudents - assessmentsDone);
       
       // 5. Materials & Tasks (Menghitung submission / komentar siswa yang belum ditandai checked/read)
@@ -3461,7 +3632,9 @@ function MainApp() {
       const plan = studentRec?.paymentPlan || 'Monthly';
       const monthPrefix = `${currentYear}-${currentMonth.padStart(2, '0')}`;
       let target = 0;
-      if (plan === 'Monthly') {
+      if (plan === 'Free') {
+          target = 0; // FREE: tidak pernah ada tagihan
+      } else if (plan === 'Monthly') {
           target = db.calendar.filter(c => c.date.startsWith(monthPrefix) && (c.sessionGroup || c.name) === mySession).length * 25000;
       } else {
           target = db.studentAttendance.filter(a => a.studentId === currentUser.studentId && a.date.startsWith(monthPrefix) && a.status === 'Present').length * 25000;
@@ -3554,7 +3727,7 @@ function MainApp() {
       case 'tutors':
         return <TutorsModule db={db} setDb={setDb} generateId={generateId} showToast={showToast} softDelete={softDelete} />;
       case 'student_attendance':
-        return <StudentAttendanceModule db={db} setDb={setDb} showToast={showToast} softDelete={softDelete} user={currentUser} generateId={generateId} />;
+        return <StudentAttendanceModule db={db} setDb={setDb} showToast={showToast} softDelete={softDelete} user={currentUser} generateId={generateId} requestConfirm={requestConfirm} />;
       case 'tutor_attendance':
         return <TutorAttendanceModule db={db} setDb={setDb} user={currentUser} showToast={showToast} softDelete={softDelete} generateId={generateId} />;
       case 'my_attendance': // STUDENT: Read Only Attendance
@@ -3589,6 +3762,7 @@ function MainApp() {
             downloadPNG={downloadPNG}
             softDelete={softDelete}
             language={language}
+            isDbDirty={isDbDirty}
         />
       );
       case 'my_payments': // STUDENT: Read Only Payments
@@ -3681,40 +3855,38 @@ function MainApp() {
         </div>
 
         <div className="flex-1 overflow-y-auto py-4 px-3 space-y-1 custom-scrollbar">
-          {NAVIGATION.filter((nav) => nav.roles.includes(currentUser.role)).map((nav) => {
-            const badge = badgeCounts[nav.id] || 0;
-            
-            const getNavLabel = (label) => {
-               if (language === 'en') return label;
-               const dict = {
-                  'Dashboard': 'Beranda',
-                  'Announcements': 'Pengumuman',
-                  'Students Directory': 'Direktori Siswa',
-                  'Tutors Directory': 'Direktori Tutor',
-                  'Academic Calendar': 'Kalender Akademik',
-                  'Tutor Check-In': 'Absensi Tutor',
-                  'Student Attendance': 'Kehadiran Siswa',
-                  'My Attendance': 'Kehadiran Saya',
-                  'Learning Journals': 'Jurnal Belajar',
-                  'My Learning Journal': 'Jurnal Belajar',
-                  'Monthly Assessment': 'Penilaian Bulanan',
-                  'My Assessment': 'Penilaian Saya',
-                  'Materials & Tasks': 'Materi & Tugas',
-                  'My Materials': 'Materi Saya',
-                  'Daily Speaking': 'Tantangan Harian', // Terjemahan Menu Baru
-                  'My Quests & Badges': 'Misi & Lencana',
-                  'My Academic Report': 'Rapor Akademik',
-                  'Payments': 'Pembayaran (SPP)',
-                  'My Payment Status': 'Status Pembayaran',
-                  'Payroll': 'Penggajian (Gaji)',
-                  'History & Reports': 'Riwayat & Laporan',
-                  'User Management': 'Manajemen Pengguna',
-                  'My Profile': 'Profil Saya',
-                  'System Logs': 'Log Sistem',
-                  'Recycle Bin': 'Tempat Sampah'
-               };
-               return dict[label] || label;
+          {/* BUG FIX #10: getNavLabel moved outside map() — was being re-created on every render */}
+          {(() => {
+            const NAV_LABEL_DICT_ID = {
+              'Dashboard': 'Beranda',
+              'Announcements': 'Pengumuman',
+              'Students Directory': 'Direktori Siswa',
+              'Tutors Directory': 'Direktori Tutor',
+              'Academic Calendar': 'Kalender Akademik',
+              'Tutor Check-In': 'Absensi Tutor',
+              'Student Attendance': 'Kehadiran Siswa',
+              'My Attendance': 'Kehadiran Saya',
+              'Learning Journals': 'Jurnal Belajar',
+              'My Learning Journal': 'Jurnal Belajar',
+              'Monthly Assessment': 'Penilaian Bulanan',
+              'My Assessment': 'Penilaian Saya',
+              'Materials & Tasks': 'Materi & Tugas',
+              'My Materials': 'Materi Saya',
+              'Daily Speaking': 'Tantangan Harian',
+              'My Quests & Badges': 'Misi & Lencana',
+              'My Academic Report': 'Rapor Akademik',
+              'Payments': 'Pembayaran (SPP)',
+              'My Payment Status': 'Status Pembayaran',
+              'Payroll': 'Penggajian (Gaji)',
+              'History & Reports': 'Riwayat & Laporan',
+              'User Management': 'Manajemen Pengguna',
+              'My Profile': 'Profil Saya',
+              'System Logs': 'Log Sistem',
+              'Recycle Bin': 'Tempat Sampah'
             };
+            const getNavLabel = (label) => language === 'en' ? label : (NAV_LABEL_DICT_ID[label] || label);
+            return NAVIGATION.filter((nav) => nav.roles.includes(currentUser.role)).map((nav) => {
+            const badge = badgeCounts[nav.id] || 0;
 
             return (
               <button
@@ -3735,7 +3907,8 @@ function MainApp() {
                 )}
               </button>
             );
-          })}
+          });
+          })()}
         </div>
 
         <div className="p-4 border-t border-gray-800 bg-[#0B0F19]">
@@ -3877,16 +4050,30 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
   const defaultLevel = validLevelsForTutor.length > 0 ? validLevelsForTutor[0] : LEVELS[0];
   const defaultClass = CLASS_MAPPING[defaultLevel].find(cls => user?.role === 'tutor' ? parseSessions(user.teachingSession).includes(getSessionGroup(cls)) : true) || CLASS_MAPPING[defaultLevel][0];
   
-  const [formData, setFormData] = useState({ id: '', name: '', gender: 'Male', level: defaultLevel, class: defaultClass, paymentPlan: 'Monthly', status: 'Active', teacherComment: '', sessionOverride: 'Default', enrollmentStatus: 'Returning', whatsapp: '' });
+  const [formData, setFormData] = useState({ id: '', name: '', gender: 'Male', level: defaultLevel, class: defaultClass, paymentPlan: 'Monthly', status: 'Active', teacherComment: '', sessionOverride: 'Default', enrollmentStatus: 'Returning', whatsapp: '', billingStartMonth: '' });
   const [isAdding, setIsAdding] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const debouncedSearchTerm = useDebounce(searchTerm, 300);
   const [filterLevel, setFilterLevel] = useState('');
   const [filterSession, setFilterSession] = useState('');
   const [filterClass, setFilterClass] = useState('');
+  const [filterPaymentPlan, setFilterPaymentPlan] = useState('');
 
   const [rowsPerPage, setRowsPerPage] = useState<number | string>(10);
   const [currentPage, setCurrentPage] = useState(1);
+
+  // Hitung kehadiran bulan berjalan per siswa (Present saja)
+  const attendanceThisMonth = useMemo(() => {
+    const now = new Date();
+    const monthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const map: Record<string, number> = {};
+    (db.studentAttendance || []).forEach(a => {
+      if (String(a.date || '').startsWith(monthPrefix) && a.status === 'Present') {
+        map[a.studentId] = (map[a.studentId] || 0) + 1;
+      }
+    });
+    return map;
+  }, [db.studentAttendance]);
 
   useEffect(() => {
     if (!formData.id && formData.level) {
@@ -3900,7 +4087,7 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [debouncedSearchTerm, filterLevel, filterSession, filterClass, rowsPerPage]);
+  }, [debouncedSearchTerm, filterLevel, filterSession, filterClass, filterPaymentPlan, rowsPerPage]);
 
   const handleSave = (e) => {
     e.preventDefault();
@@ -3909,7 +4096,18 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
     const finalWa = normalizeWhatsapp(formData.whatsapp);
     // FIX BUG #2: tambah updatedAt agar LWW di mergeByIds tahu versi lokal lebih baru dari cloud
     const rec = { ...formData, whatsapp: finalWa, id: formData.id || generateId('STU', 'students'), updatedAt: getLocalTimestamp() };
-    setDb((prev) => ({ ...prev, students: formData.id ? prev.students.map((s) => (s.id === formData.id ? rec : s)) : [...prev.students, rec] }));
+    setDb((prev) => ({ 
+      ...prev, 
+      students: formData.id 
+        ? prev.students.map((s) => {
+            if (s.id !== formData.id) return s;
+            // BUGFIX SESSION OVERRIDE: Merge existing student record dengan form data agar field
+            // yang tidak ada di form (bonusExp, speakingChallengeCompletedCount, dll) tidak hilang.
+            // Ini juga mencegah sessionOverride hilang jika versi lama student dari cloud tidak punya field ini.
+            return { ...s, ...rec };
+          })
+        : [...prev.students, rec]
+    }));
     showToast('Student saved');
     setIsAdding(false);
   };
@@ -3922,7 +4120,8 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
     // Jika filterSession kosong, tampilkan semua siswa dari semua sesi tutor (matchTutor sudah menjaga scope)
     const matchSessionFilter = filterSession ? getStudentSession(s) === filterSession : true;
     const matchTutor = user?.role === 'tutor' ? parseSessions(user.teachingSession).includes(getStudentSession(s)) : true;
-    return matchSearch && matchLevel && matchClass && matchSessionFilter && matchTutor;
+    const matchPlan = filterPaymentPlan ? s.paymentPlan === filterPaymentPlan : true;
+    return matchSearch && matchLevel && matchClass && matchSessionFilter && matchTutor && matchPlan;
   }));
 
   const isAll = rowsPerPage === 'All';
@@ -3936,7 +4135,7 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
       <div className="flex justify-between items-center">
         <div><h2 className="text-2xl font-bold text-white mb-1">Students Directory</h2><p className="text-gray-400 text-sm">Manage student records, enrollment, and class placement.</p></div>
         {(!user || user.role === 'admin' || user.role === 'tutor') && (
-          <Button onClick={() => { setFormData({ id: '', name: '', gender: 'Male', level: defaultLevel, class: defaultClass, paymentPlan: 'Monthly', status: 'Active', teacherComment: '', sessionOverride: 'Default', enrollmentStatus: 'Returning', whatsapp: '' }); setIsAdding(!isAdding); }} icon={Plus}>Add Student</Button>
+          <Button onClick={() => { setFormData({ id: '', name: '', gender: 'Male', level: defaultLevel, class: defaultClass, paymentPlan: 'Monthly', status: 'Active', teacherComment: '', sessionOverride: 'Default', enrollmentStatus: 'Returning', whatsapp: '', billingStartMonth: '' }); setIsAdding(!isAdding); }} icon={Plus}>Add Student</Button>
         )}
       </div>
       {isAdding && (
@@ -3962,12 +4161,27 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
               <Input label="Gender" type="select" options={['Male', 'Female']} value={formData.gender} onChange={(v) => setFormData({ ...formData, gender: v })} required />
               <Input label="Enrollment Status" type="select" options={['New', 'Returning']} value={formData.enrollmentStatus} onChange={(v) => setFormData({ ...formData, enrollmentStatus: v })} required />
             </div>
+            {/* BILLING START MONTH — hanya tampil jika siswa baru atau admin mengatur */}
+            <div className="mb-4 p-3 rounded-lg border border-amber-500/20 bg-amber-500/5">
+              <label className="block text-sm text-amber-400 font-semibold mb-1 flex items-center gap-2">
+                <CalendarIcon size={14} /> Billing Start Month <span className="text-gray-500 font-normal">(Opsional)</span>
+              </label>
+              <input
+                type="month"
+                className="w-full bg-[#0B0F19] border border-gray-700 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-amber-400 transition-all"
+                value={formData.billingStartMonth || ''}
+                onChange={(e) => setFormData({ ...formData, billingStartMonth: e.target.value })}
+              />
+              <p className="text-[11px] text-gray-500 mt-1.5 leading-tight">
+                Kosongkan jika tagihan mulai bulan ini. Isi jika siswa baru akan mulai membayar bulan depan atau seterusnya — bulan sebelum tanggal ini <strong className="text-amber-400">tidak akan dihitung</strong> dalam expected collected.
+              </p>
+            </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
               <Input label="Level" type="select" options={validLevelsForTutor} value={formData.level} onChange={(v) => setFormData({ ...formData, level: v })} required />
               <Input label="Class" type="select" options={(CLASS_MAPPING[formData.level] || []).filter(cls => user?.role === 'tutor' ? parseSessions(user.teachingSession).includes(getSessionGroup(cls)) : true)} value={formData.class} onChange={(v) => setFormData({ ...formData, class: v })} required />
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-              <Input label="Payment Plan" type="select" options={['Monthly', 'Per Visit']} value={formData.paymentPlan} onChange={(v) => setFormData({ ...formData, paymentPlan: v })} required />
+              <Input label="Payment Plan" type="select" options={['Monthly', 'Per Visit', 'Free']} value={formData.paymentPlan} onChange={(v) => setFormData({ ...formData, paymentPlan: v })} required />
               <Input label="Status" type="select" options={['Active', 'Inactive']} value={formData.status} onChange={(v) => setFormData({ ...formData, status: v })} />
             </div>
             <div className="mb-6">
@@ -3982,38 +4196,61 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
         </Card>
       )}
       <Card className="p-0 overflow-hidden flex flex-col">
-        <div className="p-4 sm:p-5 bg-[#0A0E17] border-b border-gray-800 grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-          <input type="text" placeholder="Search students..." className="w-full bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
-          <select className="w-full bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all" value={filterLevel} onChange={(e) => { setFilterLevel(e.target.value); setFilterClass(''); }}>
-            <option value="">All Levels</option>
-            {validLevelsForTutor.map((l) => <option key={l} value={l}>{l}</option>)}
-          </select>
-          <select className="w-full bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all" value={filterClass} onChange={(e) => setFilterClass(e.target.value)} disabled={!filterLevel}>
-            <option value="">All Classes</option>
-            {filterLevel && (CLASS_MAPPING[filterLevel] || []).filter(cls => user?.role === 'tutor' ? parseSessions(user.teachingSession).includes(getSessionGroup(cls)) : true).map((c) => <option key={c} value={c}>{c}</option>)}
-          </select>
-          <select 
-            className="w-full bg-[#151B26] border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-[#00D4FF]" 
-            value={filterSession} 
-            onChange={(e) => setFilterSession(e.target.value)}
-          >
-            {user?.role === 'tutor' ? (
-              <>
-                <option value="">All My Sessions</option>
-                {parseSessions(user.teachingSession).map((s) => <option key={s} value={s}>{s}</option>)}
-              </>
-            ) : (
-              <>
-                <option value="">All Sessions</option>
-                {SESSIONS.map((l) => <option key={l} value={l}>{l}</option>)}
-              </>
-            )}
-          </select>
+        <div className="p-4 sm:p-5 bg-[#0A0E17] border-b border-gray-800 space-y-3">
+          {/* Row 1: Search bar full width */}
+          <div className="relative">
+            <Search size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-500 pointer-events-none" />
+            <input
+              type="text"
+              placeholder="Search students by name or ID..."
+              className="w-full bg-[#151B26] border border-gray-700 rounded-lg pl-10 pr-4 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all placeholder-gray-600"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+            />
+          </div>
+          {/* Row 2: 4 filter dropdowns evenly distributed */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <select className="w-full bg-[#151B26] border border-gray-700 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all text-sm" value={filterLevel} onChange={(e) => { setFilterLevel(e.target.value); setFilterClass(''); }}>
+              <option value="">All Levels</option>
+              {validLevelsForTutor.map((l) => <option key={l} value={l}>{l}</option>)}
+            </select>
+            <select className="w-full bg-[#151B26] border border-gray-700 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all text-sm disabled:opacity-40 disabled:cursor-not-allowed" value={filterClass} onChange={(e) => setFilterClass(e.target.value)} disabled={!filterLevel}>
+              <option value="">All Classes</option>
+              {filterLevel && (CLASS_MAPPING[filterLevel] || []).filter(cls => user?.role === 'tutor' ? parseSessions(user.teachingSession).includes(getSessionGroup(cls)) : true).map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <select
+              className="w-full bg-[#151B26] border border-gray-700 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all text-sm"
+              value={filterSession}
+              onChange={(e) => setFilterSession(e.target.value)}
+            >
+              {user?.role === 'tutor' ? (
+                <>
+                  <option value="">All My Sessions</option>
+                  {parseSessions(user.teachingSession).map((s) => <option key={s} value={s}>{s}</option>)}
+                </>
+              ) : (
+                <>
+                  <option value="">All Sessions</option>
+                  {SESSIONS.map((l) => <option key={l} value={l}>{l}</option>)}
+                </>
+              )}
+            </select>
+            <select
+              className="w-full bg-[#151B26] border border-gray-700 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:border-[#00D4FF] transition-all text-sm"
+              value={filterPaymentPlan}
+              onChange={(e) => setFilterPaymentPlan(e.target.value)}
+            >
+              <option value="">All Plans</option>
+              <option value="Monthly">Monthly</option>
+              <option value="Per Visit">Per Visit</option>
+              <option value="Free">Free</option>
+            </select>
+          </div>
         </div>
         <div className="overflow-x-auto">
         <table className="w-full text-left text-sm">
           <thead className="bg-[#0B0F19] border-b border-gray-800 text-gray-400 uppercase tracking-wider text-[11px] font-bold">
-            <tr><th className="p-4 text-center w-12 text-gray-400">No.</th><th className="p-4">ID</th><th className="p-4">Name</th><th className="p-4">Level</th><th className="p-4">Class & Plan</th><th className="p-4">WhatsApp</th><th className="p-4 text-center">Status</th>{(!user || user.role === 'admin' || user.role === 'tutor') && <th className="p-4 text-center">Actions</th>}</tr>
+            <tr><th className="p-4 text-center w-12 text-gray-400">No.</th><th className="p-4">ID</th><th className="p-4">Name</th><th className="p-4">Level</th><th className="p-4">Class & Plan</th><th className="p-4 text-center">Attended</th><th className="p-4">WhatsApp</th><th className="p-4 text-center">Status</th>{(!user || user.role === 'admin' || user.role === 'tutor') && <th className="p-4 text-center">Actions</th>}</tr>
           </thead>
           <tbody className="divide-y divide-gray-800">
             {paginatedData.map((s, index) => (
@@ -4021,13 +4258,28 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
                 <td className="p-4 text-center text-gray-500 font-medium">{startIndex + index + 1}</td>
                 <td className="p-4 font-mono text-gray-400">{s.id}</td>
                 <td className="p-4 text-white font-medium">
-                  <div className="flex items-center">{s.name} <NewBadge isNew={s.enrollmentStatus} /></div>
+                  <div className="flex items-center">{s.name} <NewBadge isNew={s.enrollmentStatus} billingStartMonth={s.billingStartMonth || null} /></div>
 
                 </td>
                 <td className="p-4 text-[#00D4FF]">{s.level}</td>
                 <td className="p-4 leading-tight">
                   <span className="font-bold text-gray-300">{s.class}</span><br/>
-                  <span className={`text-[11px] px-2 py-0.5 rounded font-semibold uppercase tracking-wide mt-1 inline-block border ${s.paymentPlan === 'Per Visit' ? 'bg-purple-500/20 text-purple-300 border-purple-500/50' : 'bg-blue-500/20 text-blue-300 border-blue-500/50'}`}>{s.paymentPlan}</span>
+                  <span className={`text-[11px] px-2 py-0.5 rounded font-semibold uppercase tracking-wide mt-1 inline-block border ${s.paymentPlan === 'Per Visit' ? 'bg-purple-500/20 text-purple-300 border-purple-500/50' : s.paymentPlan === 'Free' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/50' : 'bg-blue-500/20 text-blue-300 border-blue-500/50'}`}>{s.paymentPlan}</span>
+                </td>
+                <td className="p-4 text-center">
+                  {(() => {
+                    const count = attendanceThisMonth[s.id] || 0;
+                    const isPerVisit = s.paymentPlan === 'Per Visit';
+                    return (
+                      <span className={`inline-flex items-center justify-center min-w-[2rem] px-2 py-1 rounded-full text-sm font-bold ${
+                        count === 0 ? 'bg-gray-700/50 text-gray-500' :
+                        isPerVisit ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40' :
+                        'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                      }`}>
+                        {count}x
+                      </span>
+                    );
+                  })()}
                 </td>
                 <td className="p-4 text-center"><Badge status={s.status} /></td>
                 <td className="p-4 text-gray-400 text-sm">{s.whatsapp ? String(s.whatsapp).replace(/^'/, '') : <span className="text-gray-600 italic text-xs">No WA</span>}</td>
@@ -4047,7 +4299,7 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
               </tr>
             ))}
             {paginatedData.length === 0 && (
-               <tr><td colSpan={8}><EmptyState icon={Users} title="No students found" description="Try adjusting your search or filter criteria." /></td></tr>
+               <tr><td colSpan={9}><EmptyState icon={Users} title="No students found" description="Try adjusting your search or filter criteria." /></td></tr>
             )}
           </tbody>
         </table>
@@ -4082,7 +4334,7 @@ function StudentsModule({ db, setDb, generateId, showToast, softDelete, user }) 
   );
 }
 
-function StudentAttendanceModule({ db, setDb, showToast, softDelete, user, generateId }) {
+function StudentAttendanceModule({ db, setDb, showToast, softDelete, user, generateId, requestConfirm }) {
   const [selectedScheduleId, setSelectedScheduleId] = useState('');
   const [attendanceData, setAttendanceData] = useState({});
   const [editingId, setEditingId] = useState(null);
@@ -4171,9 +4423,36 @@ function StudentAttendanceModule({ db, setDb, showToast, softDelete, user, gener
   };
 
   const saveEdit = (id) => {
-    setDb((p) => ({ ...p, studentAttendance: p.studentAttendance.map((a) => a.id === id ? { ...a, status: editStatus } : a) }));
+    // BUGFIX (BUG 5): Tambah timestamp agar LWW di mergeByIds tahu versi lokal lebih baru dari cloud
+    setDb((p) => ({ ...p, studentAttendance: p.studentAttendance.map((a) => a.id === id ? { ...a, status: editStatus, timestamp: getLocalTimestamp() } : a) }));
     setEditingId(null);
     showToast('Updated');
+  };
+
+  const handleDeleteSession = () => {
+    if (!editScheduleIdFilter) return;
+    const sessionRecords = db.studentAttendance.filter(a => a.scheduleId === editScheduleIdFilter);
+    if (sessionRecords.length === 0) return;
+    const schedInfo = markedSchedules.find(s => s.id === editScheduleIdFilter);
+    const label = schedInfo ? `${schedInfo.date} - ${schedInfo.sessionGroup || schedInfo.name}` : editScheduleIdFilter;
+    requestConfirm(
+      'Delete Entire Session?',
+      `This will move all ${sessionRecords.length} attendance record(s) for "${label}" to the Recycle Bin. This can be undone from the Recycle Bin.`,
+      () => {
+        const now = getLocalTimestamp();
+        const binItems = sessionRecords.map(item => {
+          const binId = 'BIN-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6).toUpperCase();
+          return { id: binId, binId, originalCollection: 'studentAttendance', deletedAt: now, data: item };
+        });
+        setDb(prev => ({
+          ...prev,
+          studentAttendance: prev.studentAttendance.filter(a => a.scheduleId !== editScheduleIdFilter),
+          recycleBin: [...(prev.recycleBin || []), ...binItems],
+        }));
+        setEditScheduleIdFilter('');
+        showToast(sessionRecords.length + ' records moved to Recycle Bin', 'warning');
+      }
+    );
   };
 
   const visibleAttendanceRecords = useMemo(() => {
@@ -4264,7 +4543,7 @@ function StudentAttendanceModule({ db, setDb, showToast, softDelete, user, gener
             {studentsToMark.length > 0 ? studentsToMark.map((s, index) => (
               <tr key={s.id} className="hover:bg-[#0B0F19]">
                 <td className="p-4 text-center"><span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-[#00D4FF]/10 border border-[#00D4FF]/20 text-[11px] font-black text-[#00D4FF]">{String(index + 1).padStart(2, '0')}</span></td>
-                <td className="p-4 text-white font-medium"><div className="flex items-center">{s.name} <NewBadge isNew={s.enrollmentStatus} /> <span className="text-xs text-gray-500 ml-1.5">({s.class})</span>{checkHasDebt(s.id, selectedSchedule?.date) && <span title="Memiliki tunggakan pembayaran"><AlertCircle size={14} className="text-amber-500 ml-2" /></span>}</div></td>
+                <td className="p-4 text-white font-medium"><div className="flex items-center">{s.name} <NewBadge isNew={s.enrollmentStatus} billingStartMonth={s.billingStartMonth || null} /> <span className="text-xs text-gray-500 ml-1.5">({s.class})</span>{checkHasDebt(s.id, selectedSchedule?.date) && <span title="Memiliki tunggakan pembayaran"><AlertCircle size={14} className="text-amber-500 ml-2" /></span>}</div></td>
                 {['Present', 'Sick', 'Excused', 'Absent'].map((status) => (
                   <td key={status} className="p-4 text-center">
                     <input type="radio" checked={attendanceData[s.id] === status} onChange={() => setAttendanceData((p) => ({ ...p, [s.id]: status }))} className={`w-5 h-5 cursor-pointer ${statusColors[status]}`} />
@@ -4305,6 +4584,16 @@ function StudentAttendanceModule({ db, setDb, showToast, softDelete, user, gener
              </select>
              {!editScheduleIdFilter && (
                 <input type="date" className="bg-[#151B26] border border-gray-700 rounded-lg px-3 py-1.5 text-white text-sm" value={viewDate} onChange={e => setViewDate(e.target.value)} />
+             )}
+             {editScheduleIdFilter && (
+               <button
+                 onClick={handleDeleteSession}
+                 className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 hover:bg-red-500/20 hover:border-red-500/60 transition-all text-sm font-semibold whitespace-nowrap"
+                 title="Delete all records in this session"
+               >
+                 <Trash2 size={14} />
+                 Delete This Session
+               </button>
              )}
           </div>
         </div>
@@ -4364,7 +4653,8 @@ function TutorAttendanceModule({ db, setDb, user, showToast, softDelete, generat
     const time = dateObj.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
 
     const existingRecords = db.tutorAttendance || [];
-    if (existingRecords.find((a) => a.tutorId === user.id && a.date === today)) {
+    // BUG FIX #4: Also match legacy records that only store name (no tutorId) to prevent duplicates
+    if (existingRecords.find((a) => (a.tutorId === user.id || (!a.tutorId && a.name === user.name)) && a.date === today)) {
        return showToast('Already checked in today', 'warning');
     }
     // Fix #2: only allow check-in when there is a scheduled class today
@@ -4602,6 +4892,7 @@ function AssessmentsModule({ db, setDb, generateId, showToast, user }) {
       const assessmentRecord = {
         id: existingIdx >= 0 ? newAssessments[existingIdx].id : generateId('ASS', 'assessments'),
         studentId: student.id, studentName: student.name, level: student.level, class: student.class, month: String(month), year: String(year), sessionGroup: sessionGroup, scores: cleanedScores, average, grade,
+        updatedAt: getLocalTimestamp(), // FIX BUG 3: LWW butuh timestamp agar mergeByIds bisa memilih versi terbaru
       };
 
       if (existingIdx >= 0) newAssessments[existingIdx] = assessmentRecord;
@@ -4654,7 +4945,8 @@ function AssessmentsModule({ db, setDb, generateId, showToast, user }) {
                 <li key={m.id} className="text-sm bg-[#151B26] p-3 rounded-lg border border-gray-800">
                   <div className="flex justify-between items-center mb-1">
                     <span className="text-[#00D4FF] font-medium">{m.sessionGroup}</span>
-                    <span className="text-gray-500 text-xs">{new Date(m.date).toLocaleDateString('en-GB')}</span>
+                    {/* FIX #12: Gunakan safeDateDisplay agar tidak ada UTC-1-day bug */}
+                    <span className="text-gray-500 text-xs">{safeDateDisplay(m.date, 'en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' })}</span>
                   </div>
                   <span className="text-gray-300 font-medium">Topic: </span><span className="text-white">{m.topic}</span>
                 </li>
@@ -4692,7 +4984,7 @@ function AssessmentsModule({ db, setDb, generateId, showToast, user }) {
                 return (
                   <tr key={student.id} className="hover:bg-[#0B0F19] transition-colors" style={{ height: '50px' }}>
                     <td className="py-1 px-4 text-center text-gray-500 font-medium">{index + 1}</td>
-                    <td className="py-1 px-4 text-white font-medium whitespace-nowrap"><div className="flex items-center">{student.name} <NewBadge isNew={student.enrollmentStatus} /></div></td>
+                    <td className="py-1 px-4 text-white font-medium whitespace-nowrap"><div className="flex items-center">{student.name} <NewBadge isNew={student.enrollmentStatus} billingStartMonth={student.billingStartMonth || null} /></div></td>
                     <td className="py-1 px-4 text-gray-400 text-xs whitespace-nowrap">{student.class}</td>
                     {subjects.map((sub) => (
                       <td key={sub} className="py-1 px-4 text-center">
@@ -4715,7 +5007,7 @@ function AssessmentsModule({ db, setDb, generateId, showToast, user }) {
   );
 }
 
-function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleShareImage, downloadPNG, softDelete, language = 'en' }) {
+function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleShareImage, downloadPNG, softDelete, language = 'en', isDbDirty }) {
   const [month, setMonth] = useState(new Date().getMonth() + 1);
   const [year, setYear] = useState(new Date().getFullYear());
   const [sessionGroup, setSessionGroup] = useState('All Sessions');
@@ -4740,6 +5032,18 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
   }, [debouncedSearchTerm, filterLevel, filterClass, sessionGroup, month, year, rowsPerPage]);
 
   const activeStudents = useMemo(() => sortStudentsLogically(db.students.filter((s) => s.status === 'Active')), [db.students]);
+
+  // Hitung kehadiran bulan yang sedang dilihat per siswa (Present saja)
+  const attendanceThisMonth = useMemo(() => {
+    const monthPrefix = `${year}-${String(month).padStart(2, '0')}`;
+    const map: Record<string, number> = {};
+    (db.studentAttendance || []).forEach(a => {
+      if (String(a.date || '').startsWith(monthPrefix) && a.status === 'Present') {
+        map[a.studentId] = (map[a.studentId] || 0) + 1;
+      }
+    });
+    return map;
+  }, [db.studentAttendance, month, year]);
   
   const filteredStudents = useMemo(() => {
     return activeStudents.filter((s) => {
@@ -4749,7 +5053,8 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
       const matchClass = filterClass ? s.class === filterClass : true;
       return matchSearch && matchSession && matchLevel && matchClass;
     });
-  }, [activeStudents, searchTerm, sessionGroup, filterLevel, filterClass]);
+  // FIX #6: Dependency harus debouncedSearchTerm (bukan searchTerm mentah) agar debounce bekerja
+  }, [activeStudents, debouncedSearchTerm, sessionGroup, filterLevel, filterClass]);
 
   // Pagination Logic
   const isAll = rowsPerPage === 'All';
@@ -4767,7 +5072,21 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
   }, [db.payments, month, year, filteredStudents]);
 
   const getStudentTarget = (student) => {
+    // BILLING START CHECK: Jika billingStartMonth diset dan bulan/tahun yang sedang dilihat
+    // masih SEBELUM billingStartMonth, siswa ini belum dihitung dalam expected collected.
+    if (student.billingStartMonth) {
+      const [bYear, bMonth] = student.billingStartMonth.split('-').map(Number);
+      if (bYear && bMonth) {
+        const viewYear = Number(year);
+        const viewMonth = Number(month);
+        if (viewYear < bYear || (viewYear === bYear && viewMonth < bMonth)) {
+          return 0; // Belum mulai tagih — tidak masuk hitungan
+        }
+      }
+    }
     const plan = student.paymentPlan || 'Monthly';
+    // FREE plan: target selalu 0, tidak pernah ditagih
+    if (plan === 'Free') return 0;
     const sGroup = getStudentSession(student);
     const monthPrefix = `${year}-${String(month).padStart(2, '0')}`;
     if (plan === 'Monthly') {
@@ -4799,7 +5118,16 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
       method: method,
       status: 'Paid',
       timestamp: getLocalTimestamp(), // FIX BUG #3: diperlukan untuk LWW yang benar di mergeByIds
+      updatedAt: getLocalTimestamp(), // BUGFIX (BUG PAYMENT REVERT): Wajib ada agar LWW selalu
+      // memprioritaskan lokal atas versi cloud yang mungkin datang dengan timestamp berbeda
+      // akibat konversi format Date oleh GAS/Sheets. Tanpa updatedAt, parseTime jatuh ke
+      // `timestamp` yang bisa di-misparse → timeCloud > timeLocal → cloud menang → payment hilang.
     };
+    // BUGFIX RACE CONDITION (BUG 1): Set isDbDirty SINKRON sebelum setDb agar
+    // jika finalizeLogin fetch cloud selesai di saat yang sama, guard akan aktif
+    // dan data payment baru tidak tertimpa. Jangan andalkan useEffect untuk ini
+    // karena useEffect berjalan async (microtask queue) dan bisa terlambat.
+    isDbDirty.current = true;
     // BUGFIX PAYMENT HILANG: Simpan payment baru ke localStorage SEGERA sebelum
     // sync debounce (2 detik) selesai, agar jika tab ditutup/browser crash,
     // data tidak hilang. setDb sudah memicu penyimpanan localStorage via useEffect,
@@ -4993,13 +5321,15 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
         // Compute per-student status for ALL active students (not just paginated)
         const allStudentStatuses = activeStudents.map((s) => {
           const pays = db.payments.filter(
-            (p) => p.studentId === s.id && Number(p.month) === Number(month) && String(p.year) === String(year) && p.status === 'Paid'
+            // BUGFIX: trim+toLowerCase agar tahan terhadap transformasi casing/whitespace dari GAS
+            (p) => String(p.studentId).trim().toLowerCase() === String(s.id).trim().toLowerCase() && Number(p.month) === Number(month) && String(p.year) === String(year) && p.status === 'Paid'
           );
           const totalPaid = pays.reduce((sum, p) => sum + Number(p.amount), 0);
           const target = getStudentTarget(s);
           const lastPay = pays.sort((a, b) => (a.date > b.date ? -1 : 1))[0];
           let status: 'Paid' | 'Unpaid' | 'Partial' | 'No Target' | 'Debt' | 'Deposit' = 'Unpaid';
-          if (target === 0 && totalPaid === 0) status = 'No Target';
+          if (s.paymentPlan === 'Free') status = 'No Target';
+          else if (target === 0 && totalPaid === 0) status = 'No Target';
           else if (s.paymentPlan === 'Per Visit') {
             const bal = totalPaid - target;
             if (bal < 0) status = 'Debt';
@@ -5124,8 +5454,8 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
                             <p className="text-sm font-bold text-white truncate">{s.name}</p>
                             <p className="text-[11px] text-gray-400">{s.class}</p>
                           </div>
-                          <span className={`shrink-0 text-[10px] px-2 py-0.5 rounded-full border font-bold uppercase tracking-wide ${s.paymentPlan === 'Per Visit' ? 'bg-purple-500/20 text-purple-300 border-purple-500/40' : 'bg-blue-500/20 text-blue-300 border-blue-500/40'}`}>
-                            {s.paymentPlan === 'Per Visit' ? 'Per Visit' : 'Monthly'}
+                          <span className={`shrink-0 text-[10px] px-2 py-0.5 rounded-full border font-bold uppercase tracking-wide ${s.paymentPlan === 'Per Visit' ? 'bg-purple-500/20 text-purple-300 border-purple-500/40' : s.paymentPlan === 'Free' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : 'bg-blue-500/20 text-blue-300 border-blue-500/40'}`}>
+                            {s.paymentPlan === 'Per Visit' ? 'Per Visit' : s.paymentPlan === 'Free' ? '🎁 Free' : 'Monthly'}
                           </span>
                         </div>
 
@@ -5219,16 +5549,19 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
         <div className="overflow-x-auto">
         <table className="w-full text-left text-sm">
           <thead className="bg-[#0B0F19] border-b border-gray-800 text-gray-400 uppercase tracking-wider text-[11px] font-bold">
-            <tr><th className="p-4 text-center w-12 text-gray-400">No.</th><th className="p-4 text-center">Student</th><th className="p-4 text-center">Class & Plan</th><th className="p-4 text-center">Status</th><th className="p-4 text-center">Balance / Target</th><th className="p-4 text-center">Actions</th></tr>
+            <tr><th className="p-4 text-center w-12 text-gray-400">No.</th><th className="p-4 text-center">Student</th><th className="p-4 text-center">Class & Plan</th><th className="p-4 text-center">Attended</th><th className="p-4 text-center">Status</th><th className="p-4 text-center">Balance / Target</th><th className="p-4 text-center">Actions</th></tr>
           </thead>
           <tbody className="divide-y divide-gray-800">
             {paginatedData.map((s, index) => {
-              const studentPayments = db.payments.filter((p) => p.studentId === s.id && Number(p.month) === Number(month) && String(p.year) === String(year) && p.status === 'Paid');
+              // BUGFIX (BUG PAYMENT REVERT): Gunakan trim().toLowerCase() agar filter tetap
+              // cocok meski GAS/Sheets mengubah casing atau menambah whitespace pada studentId.
+              const studentPayments = db.payments.filter((p) => String(p.studentId).trim().toLowerCase() === String(s.id).trim().toLowerCase() && Number(p.month) === Number(month) && String(p.year) === String(year) && p.status === 'Paid');
               const totalPaid = studentPayments.reduce((sum, p) => sum + Number(p.amount), 0);
               const target = getStudentTarget(s);
               
               let status = 'Unpaid';
-              if (target === 0 && totalPaid === 0) status = 'No Target';
+              if (s.paymentPlan === 'Free') status = 'No Target';
+              else if (target === 0 && totalPaid === 0) status = 'No Target';
               else if (totalPaid >= target && target > 0) status = 'Paid';
               else if (totalPaid > 0) status = 'Partial';
 
@@ -5243,16 +5576,33 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
               return (
                 <tr key={s.id} className="hover:bg-[#0B0F19]">
                   <td className="p-4 text-center text-gray-500 font-medium">{startIndex + index + 1}</td>
-                  <td className="p-4 text-center text-white font-medium"><div className="flex items-center justify-center">{s.name} <NewBadge isNew={s.enrollmentStatus} /></div></td>
+                  <td className="p-4 text-center text-white font-medium"><div className="flex items-center justify-center">{s.name} <NewBadge isNew={s.enrollmentStatus} billingStartMonth={s.billingStartMonth || null} /></div></td>
                   <td className="p-4 text-center leading-tight">
                     <span className="font-bold text-gray-300">{s.class}</span> <br/>
-                    <span className={`text-[11px] px-2 py-0.5 rounded font-semibold uppercase tracking-wide mt-1.5 inline-block border ${s.paymentPlan === 'Per Visit' ? 'bg-purple-500/20 text-purple-300 border-purple-500/50 shadow-[0_0_10px_rgba(168,85,247,0.3)]' : 'bg-blue-500/20 text-blue-300 border-blue-500/50 shadow-[0_0_10px_rgba(59,130,246,0.3)]'}`}>
-                      {s.paymentPlan === 'Per Visit' ? 'Per Visit' : 'Monthly'}
+                    <span className={`text-[11px] px-2 py-0.5 rounded font-semibold uppercase tracking-wide mt-1.5 inline-block border ${s.paymentPlan === 'Per Visit' ? 'bg-purple-500/20 text-purple-300 border-purple-500/50 shadow-[0_0_10px_rgba(168,85,247,0.3)]' : s.paymentPlan === 'Free' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/50 shadow-[0_0_10px_rgba(16,185,129,0.3)]' : 'bg-blue-500/20 text-blue-300 border-blue-500/50 shadow-[0_0_10px_rgba(59,130,246,0.3)]'}`}>
+                      {s.paymentPlan === 'Per Visit' ? 'Per Visit' : s.paymentPlan === 'Free' ? '🎁 Free' : 'Monthly'}
                     </span>
+                  </td>
+                  <td className="p-4 text-center">
+                    {(() => {
+                      const count = attendanceThisMonth[s.id] || 0;
+                      const isPerVisit = s.paymentPlan === 'Per Visit';
+                      return (
+                        <span className={`inline-flex items-center justify-center min-w-[2rem] px-2 py-1 rounded-full text-sm font-bold ${
+                          count === 0 ? 'bg-gray-700/50 text-gray-500' :
+                          isPerVisit ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40' :
+                          'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                        }`}>
+                          {count}x
+                        </span>
+                      );
+                    })()}
                   </td>
                   <td className="p-4 text-center"><Badge status={status} /></td>
                   <td className="p-4 text-center">
-                     {s.paymentPlan === 'Per Visit' ? (
+                     {s.paymentPlan === 'Free' ? (
+                       <span className="text-emerald-400 text-xs font-bold">Complimentary</span>
+                     ) : s.paymentPlan === 'Per Visit' ? (
                        <>
                          <span className={`font-bold ${balance < 0 ? 'text-red-400' : balance > 0 ? 'text-cyan-400' : 'text-gray-500'}`}>Rp {balance.toLocaleString()}</span>
                          <br/>
@@ -5268,7 +5618,9 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
                   </td>
                   <td className="p-4 align-middle">
                     <div className="flex items-center justify-center gap-3 flex-wrap xl:flex-nowrap">
-                      {(s.paymentPlan === 'Per Visit' || !(s.paymentPlan === 'Monthly' && status === 'Paid')) && (
+                      {s.paymentPlan === 'Free' ? (
+                        <span className="text-xs text-emerald-400 font-semibold bg-emerald-500/10 border border-emerald-500/20 px-3 py-1.5 rounded-lg">🎁 No billing</span>
+                      ) : (s.paymentPlan === 'Per Visit' || !(s.paymentPlan === 'Monthly' && status === 'Paid')) && (
                          <div className="flex items-center bg-[#0B0F19] rounded-lg border border-gray-700 overflow-hidden shadow-inner shrink-0 transition-all focus-within:border-[#00D4FF]/60 focus-within:ring-1 focus-within:ring-[#00D4FF]/20">
                            <select
                               className="bg-transparent border-none px-2.5 py-2 text-white text-[11px] focus:ring-0 focus:outline-none w-[80px] cursor-pointer appearance-none"
@@ -5322,18 +5674,18 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
                               const monthPrefix = `${year}-${String(month).padStart(2, '0')}`;
                               const presentCount = db.studentAttendance.filter(a => a.studentId === s.id && a.date.startsWith(monthPrefix) && a.status === 'Present').length;
                               const balanceText = balance < 0
-                                 ? `Sisa Tagihan: Rp ${Math.abs(balance).toLocaleString()}`
+                                 ? `Remaining Balance: Rp ${Math.abs(balance).toLocaleString()}`
                                  : balance > 0
-                                 ? `Saldo/Deposit: Rp ${balance.toLocaleString()}`
-                                 : 'Status: Lunas';
-                              const message = `Halo, berikut rekap pembayaran ${s.name} periode ${MONTHS[month - 1]} ${year}:\n\nKehadiran: ${presentCount}x\nUang Masuk: Rp ${totalPaid.toLocaleString()}\nTarget: Rp ${target.toLocaleString()}\n${balanceText}\n\nTerima kasih.`;
+                                 ? `Deposit/Credit: Rp ${balance.toLocaleString()}`
+                                 : 'Status: Paid';
+                              const message = `Hi, here is the payment summary for ${s.name} — ${MONTHS[month - 1]} ${year}:\n\nAttended: ${presentCount}x\nAmount Paid: Rp ${totalPaid.toLocaleString()}\nTarget: Rp ${target.toLocaleString()}\n${balanceText}\n\nThank you.`;
                               const phone = normalizeWhatsapp(s.whatsapp);
                               window.open(`https://wa.me/${phone}?text=${encodeURIComponent(message)}`, '_blank');
                            }}
                            className="flex items-center gap-1.5 bg-[#151B26] border border-gray-700 hover:border-green-500/50 hover:bg-green-500/10 px-3 py-2 rounded-lg transition-colors text-[11px] text-gray-300 shadow-sm shrink-0"
                          >
                            <MessageCircle size={14} className="text-green-400" />
-                           <span>Tagih WA</span>
+                           <span>Bill via WA</span>
                          </button>
                       )}
                     </div>
@@ -5342,7 +5694,7 @@ function PaymentsModule({ db, setDb, generateId, showToast, handlePrint, handleS
               );
             })}
             {paginatedData.length === 0 && (
-               <tr><td colSpan={6}><EmptyState icon={Search} title="No records found" description="Try adjusting your search or filter criteria." /></td></tr>
+               <tr><td colSpan={7}><EmptyState icon={Search} title="No records found" description="Try adjusting your search or filter criteria." /></td></tr>
             )}
           </tbody>
         </table>
@@ -5507,7 +5859,7 @@ function HistoryReportsModule({ db, setDb, showToast, handlePrint, user }) {
                     <tr key={s.id} className="hover:bg-[#0B0F19]">
                       <td className="p-4 text-center text-gray-500 font-medium">{startIndex + index + 1}</td>
                       <td className="p-4 text-center font-mono text-gray-400">{s.id}</td>
-                      <td className="p-4 text-center text-white"><div className="flex items-center justify-center">{s.name} <NewBadge isNew={s.enrollmentStatus} /></div></td>
+                      <td className="p-4 text-center text-white"><div className="flex items-center justify-center">{s.name} <NewBadge isNew={s.enrollmentStatus} billingStartMonth={s.billingStartMonth || null} /></div></td>
                       <td className="p-4 text-center text-gray-300">{s.class}</td>
                       <td className="p-4 text-center"><Badge status={s.status} /></td>
                       <td className="p-4 flex justify-center"><Button className="bg-yellow-500 text-yellow-900 hover:bg-yellow-400 font-bold shadow-md hover:shadow-lg transition-all" icon={Eye} onClick={() => openProfile(s.id, 'student')}>VIEW HISTORY & REPORTS</Button></td>
@@ -5589,7 +5941,13 @@ function HistoryReportsModule({ db, setDb, showToast, handlePrint, user }) {
     const avgScore = assessments.length ? Math.round(assessments.reduce((sum, a) => sum + a.average, 0) / assessments.length) : 0;
     
     const payments = db.payments.filter((p) => p.studentId === student.id && p.date >= startDate && p.date <= endDate);
-    const journals = db.journals.filter((j) => j.sessionGroup === getStudentSession(student) && j.date >= startDate && j.date <= endDate);
+    const _studentSessionForReport = getStudentSession(student);
+    const journals = db.journals.filter((j) => {
+      if (j.date < startDate || j.date > endDate) return false;
+      const jg = (j.sessionGroup || '').toLowerCase().trim();
+      const sg = (_studentSessionForReport || '').toLowerCase().trim();
+      return jg === sg || jg.includes(sg) || sg.includes(jg);
+    });
 
     const studentSession = getStudentSession(student);
     const reportSubjects = studentSession === SESSIONS[0]
@@ -5634,7 +5992,8 @@ function HistoryReportsModule({ db, setDb, showToast, handlePrint, user }) {
     const handleSaveCommentBtn = () => {
       setDb(p => ({
         ...p,
-        students: p.students.map(s => s.id === student.id ? {...s, teacherComment: currentTeacherComment} : s)
+        // BUGFIX (BUG 8): updatedAt wajib agar LWW tidak menimpa comment guru dengan versi cloud lama
+        students: p.students.map(s => s.id === student.id ? {...s, teacherComment: currentTeacherComment, updatedAt: getLocalTimestamp()} : s)
       }));
       showToast('Teacher comment saved to profile');
     };
@@ -5696,7 +6055,7 @@ function HistoryReportsModule({ db, setDb, showToast, handlePrint, user }) {
               </div>
               <div className="text-right">
                 <h1 className="text-[26px] font-bold text-slate-900 tracking-tight uppercase leading-none">Monthly Academic Progress Report</h1>
-                <h2 className="text-[11px] font-medium text-slate-500 mt-2 uppercase tracking-[0.8px]">English Club Gresik • Report Period: {new Date(startDate).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })} - {new Date(endDate).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</h2>
+                <h2 className="text-[11px] font-medium text-slate-500 mt-2 uppercase tracking-[0.8px]">English Club Gresik • Report Period: {safeDateDisplay(startDate, 'en-GB', { day: 'numeric', month: 'short', year: 'numeric' })} - {safeDateDisplay(endDate, 'en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</h2>
               </div>
             </div>
 
@@ -5808,16 +6167,24 @@ function HistoryReportsModule({ db, setDb, showToast, handlePrint, user }) {
             <div className="mb-6 break-inside-avoid">
               <p className="text-[11px] font-bold text-slate-400 uppercase tracking-[0.8px] mb-1.5">Session Detail & Attendance Log</p>
               {(() => {
-                const uniqueDates = Array.from(new Set([...att.map(a => a.date), ...journals.map(j => j.date)]))
-                  .sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
-                
-                const combinedSessions = uniqueDates.map(date => {
-                    const journalEntry = journals.find(j => j.date === date);
-                    const attEntry = att.find(a => a.date === date);
+                // FIX: Anchor ke attendance siswa saja (bukan union dengan journal).
+                // Journal diisi per-sesi oleh tutor dan tidak punya studentId,
+                // sehingga union date menyebabkan baris "hantu" — topic tanpa status
+                // atau status tanpa topic. Dengan anchor ke att, setiap baris dijamin
+                // punya status kehadiran, lalu topic di-lookup dari journal yang tanggalnya sama.
+                // Jika tutor belum isi jurnal untuk tanggal itu, tampil "No lesson record entered".
+                const sortedAtt = [...att].sort((a, b) =>
+                  new Date(a.date).getTime() - new Date(b.date).getTime()
+                );
+
+                const combinedSessions = sortedAtt.map(attEntry => {
+                    // Match journal by date; jika ada duplikat tanggal, ambil yang scheduleId-nya sama
+                    const journalEntry = journals.find(j => j.date === attEntry.date && j.scheduleId === attEntry.scheduleId)
+                      || journals.find(j => j.date === attEntry.date);
                     return {
-                        date: date,
+                        date: attEntry.date,
                         topic: journalEntry?.topic || "No lesson record entered",
-                        status: attEntry?.status || "—",
+                        status: attEntry.status || "—",
                         note: (journalEntry?.notes && journalEntry.notes.trim() !== "") ? journalEntry.notes : "Auto-generated from system"
                     };
                 });
@@ -6106,7 +6473,7 @@ function TutorsModule({ db, setDb, generateId, showToast, softDelete }) {
     }
     // Simpan langsung dalam format internasional (628...) agar siap dipakai untuk link wa.me tanpa konversi lagi.
     const finalPhone = normalizeWhatsapp(formData.phone);
-    const rec = { ...formData, phone: finalPhone, id: formData.id || generateId('TUT', 'tutors') };
+    const rec = { ...formData, phone: finalPhone, id: formData.id || generateId('TUT', 'tutors'), updatedAt: getLocalTimestamp() }; // FIX BUG 3: timestamp untuk LWW
     setDb(p => ({ ...p, tutors: formData.id ? p.tutors.map(t => t.id === formData.id ? rec : t) : [...p.tutors, rec] }));
     showToast('Tutor saved');
     setIsAdding(false);
@@ -6488,7 +6855,8 @@ function PayrollModule({ db, setDb, generateId, showToast, handlePrint, handleSh
            deductions: 0,
            totalPaid: total,
            status: 'Draft',
-           date: getTodayDateLocal()
+           date: getTodayDateLocal(),
+           updatedAt: getLocalTimestamp(), // FIX BUG 3: timestamp untuk LWW
         });
      });
      
@@ -6520,7 +6888,8 @@ function PayrollModule({ db, setDb, generateId, showToast, handlePrint, handleSh
                  transportAllowance: Number(editFormData.transportAllowance),
                  additionalBonus: Number(editFormData.additionalBonus || 0),
                  deductions: Number(editFormData.deductions),
-                 totalPaid: total
+                 totalPaid: total,
+                 updatedAt: getLocalTimestamp(), // BUGFIX (BUG 7): LWW wajib tahu versi ini lebih baru
               };
            }
            return pay;
@@ -6535,7 +6904,7 @@ function PayrollModule({ db, setDb, generateId, showToast, handlePrint, handleSh
      requestConfirm('Mark as Paid', 'Are you sure you want to finalize this payroll? It will be marked as Paid.', () => {
         setDb(p => ({
            ...p,
-           payroll: p.payroll.map(pay => pay.id === id ? { ...pay, status: 'Paid', date: getTodayDateLocal() } : pay)
+           payroll: p.payroll.map(pay => pay.id === id ? { ...pay, status: 'Paid', date: getTodayDateLocal(), updatedAt: getLocalTimestamp() } : pay) // BUGFIX (BUG 7)
         }));
         showToast('Payroll marked as Paid!');
      });
@@ -6795,7 +7164,7 @@ function CalendarModule({ db, setDb, generateId, user, showToast, softDelete }) 
         showToast('Please select at least one tutor', 'warning');
         return;
      }
-     const rec = { ...formData, id: formData.id || generateId('CAL', 'calendar') };
+     const rec = { ...formData, id: formData.id || generateId('CAL', 'calendar'), updatedAt: getLocalTimestamp() }; // FIX BUG 3: timestamp untuk LWW
      setDb(p => ({ ...p, calendar: formData.id ? p.calendar.map(c => c.id === formData.id ? rec : c) : [...p.calendar, rec] }));
      showToast(formData.id ? 'Event updated' : 'Event created');
      setIsAdding(false);
@@ -6990,7 +7359,7 @@ function AnnouncementsModule({ db, setDb, generateId, user, showToast, softDelet
 
   const handleSave = (e) => {
      e.preventDefault();
-     const rec = { ...formData, id: formData.id || generateId('ANN', 'announcements'), date: getTodayDateLocal(), author: user.name };
+     const rec = { ...formData, id: formData.id || generateId('ANN', 'announcements'), date: getTodayDateLocal(), author: user.name, updatedAt: getLocalTimestamp() }; // FIX BUG 3: timestamp untuk LWW
      setDb(p => ({ ...p, announcements: formData.id ? p.announcements.map(a => a.id === formData.id ? rec : a) : [...p.announcements, rec] }));
      showToast('Announcement published');
      setIsAdding(false);
@@ -7167,7 +7536,8 @@ function SettingsModule({ db, setDb, generateId, user, showToast, requestConfirm
           username: String(formData.username || '').trim(),
           password: savedTutorPassword,
           status: formData.active || t.status || 'Active',
-          mustChangePassword: !isEditingId ? true : t.mustChangePassword 
+          mustChangePassword: !isEditingId ? true : t.mustChangePassword,
+          updatedAt: getLocalTimestamp() // BUGFIX: Tambahkan updatedAt agar LWW tidak kalah ke cloud lama
         } : t)) 
       }));
       if (!isEditingId) {
@@ -7193,7 +7563,8 @@ function SettingsModule({ db, setDb, generateId, user, showToast, requestConfirm
       if (!isEditingId && !formData.password) {
         showToast(`Password tidak diisi. Akun dibuat dengan password sementara: ${finalPassword} — Catat & berikan ke siswa!`, 'warning');
       }
-      const rec = { ...formData, name: linkedStudent.name, password: finalPassword, id: isEditingId || generateId('USR', 'users'), mustChangePassword: !isEditingId };
+      // BUGFIX: Tambahkan updatedAt agar LWW tidak kalah ke cloud lama
+      const rec = { ...formData, name: linkedStudent.name, password: finalPassword, id: isEditingId || generateId('USR', 'users'), mustChangePassword: !isEditingId, updatedAt: getLocalTimestamp() };
       setDb((p) => ({ ...p, users: isEditingId ? p.users.map((u) => (u.id === isEditingId ? rec : u)) : [...p.users, rec] }));
       if (!isEditingId) {
         setCredentialCard({ name: linkedStudent.name, username: String(formData.username).trim(), password: finalPassword, role: 'Student' });
@@ -7202,7 +7573,10 @@ function SettingsModule({ db, setDb, generateId, user, showToast, requestConfirm
       // ADMIN / SUPER ADMIN (Fallback aman untuk setiap role selain student dan tutor)
       const existingUser = db.users.find(u => u.id === isEditingId);
       const finalPassword = formData.password !== '' ? formData.password : (existingUser ? existingUser.password : '');
-      const rec = { ...formData, password: finalPassword, id: isEditingId || generateId('ADM', 'users'), mustChangePassword: !isEditingId };
+      // BUGFIX: Tambahkan updatedAt agar LWW di mergeByIds selalu memenangkan versi lokal
+      // yang baru diedit. Tanpa updatedAt, parseTime() = 0 → cloud selalu menang → nama/data
+      // yang baru diubah (termasuk nama super admin) akan kembali ke versi lama dari cloud.
+      const rec = { ...formData, password: finalPassword, id: isEditingId || generateId('ADM', 'users'), mustChangePassword: !isEditingId, updatedAt: getLocalTimestamp() };
       setDb((p) => ({ ...p, users: isEditingId ? p.users.map((u) => (u.id === isEditingId ? rec : u)) : [...p.users, rec] }));
     }
     showToast('User Saved');
@@ -7318,10 +7692,10 @@ function SettingsModule({ db, setDb, generateId, user, showToast, requestConfirm
           Muncul otomatis setelah admin buat/reset akun siswa atau tutor.
           Admin bisa salin teks atau print langsung untuk diserahkan ke siswa/tutor.
           ============================================================ */}
-      <CustomModal isOpen={!!credentialCard} onClose={() => setCredentialCard(null)} title="🎉 Akun Berhasil Dibuat">
+      <CustomModal isOpen={!!credentialCard} onClose={() => setCredentialCard(null)} title="🎉 Account Created Successfully">
         {credentialCard && (
           <div className="space-y-5">
-            <p className="text-gray-400 text-sm">Berikut adalah kredensial login untuk <span className="text-white font-semibold">{credentialCard.name}</span>. Salin atau print dan berikan langsung kepada yang bersangkutan.</p>
+            <p className="text-gray-400 text-sm">Here are the login credentials for <span className="text-white font-semibold">{credentialCard.name}</span>. Copy or print them and hand them directly to the person.</p>
 
             {/* Printable credential card */}
             <div id="credential-print-area" className="bg-[#0B0F19] border border-[#00D4FF]/30 rounded-xl p-5 space-y-4">
@@ -7342,21 +7716,21 @@ function SettingsModule({ db, setDb, generateId, user, showToast, requestConfirm
                     <p className="text-white font-mono font-bold text-lg">{credentialCard.username}</p>
                   </div>
                   <button
-                    onClick={() => { navigator.clipboard?.writeText(credentialCard.username); showToast('Username disalin!', 'success'); }}
+                    onClick={() => { navigator.clipboard?.writeText(credentialCard.username); showToast('Username copied!', 'success'); }}
                     className="p-2 hover:bg-gray-700 rounded-lg transition-colors text-gray-400 hover:text-white"
-                    title="Salin username"
+                    title="Copy username"
                   ><Copy size={16} /></button>
                 </div>
 
                 <div className="flex items-center justify-between bg-[#151B26] rounded-lg px-4 py-3">
                   <div>
-                    <p className="text-[11px] text-gray-500 uppercase tracking-wider mb-0.5">Password Sementara</p>
+                    <p className="text-[11px] text-gray-500 uppercase tracking-wider mb-0.5">Temporary Password</p>
                     <p className="text-white font-mono font-bold text-lg tracking-widest">{credentialCard.password}</p>
                   </div>
                   <button
-                    onClick={() => { navigator.clipboard?.writeText(credentialCard.password); showToast('Password disalin!', 'success'); }}
+                    onClick={() => { navigator.clipboard?.writeText(credentialCard.password); showToast('Password copied!', 'success'); }}
                     className="p-2 hover:bg-gray-700 rounded-lg transition-colors text-gray-400 hover:text-white"
-                    title="Salin password"
+                    title="Copy password"
                   ><Copy size={16} /></button>
                 </div>
               </div>
@@ -7365,8 +7739,8 @@ function SettingsModule({ db, setDb, generateId, user, showToast, requestConfirm
                 <AlertCircle size={16} className="text-amber-400 mt-0.5 shrink-0" />
                 <p className="text-amber-300 text-xs leading-relaxed">
                   {credentialCard.role === 'Student' || credentialCard.role === 'Tutor'
-                    ? `${credentialCard.name} akan diminta mengganti password ini saat login pertama kali.`
-                    : 'Pastikan credentials ini diserahkan secara langsung atau melalui jalur yang aman.'}
+                    ? `${credentialCard.name} will be prompted to change this password on first login.`
+                    : 'Make sure these credentials are delivered in person or through a secure channel.'}
                 </p>
               </div>
             </div>
@@ -7375,18 +7749,18 @@ function SettingsModule({ db, setDb, generateId, user, showToast, requestConfirm
             <div className="flex flex-col sm:flex-row gap-3 pt-1">
               <button
                 onClick={() => {
-                  const text = `LOGIN CREDENTIALS\n${'─'.repeat(30)}\nNama    : ${credentialCard.name}\nRole    : ${credentialCard.role}\nUsername: ${credentialCard.username}\nPassword: ${credentialCard.password}\n${'─'.repeat(30)}\n* Ganti password setelah login pertama.`;
+                  const text = `LOGIN CREDENTIALS\n${'─'.repeat(30)}\nName    : ${credentialCard.name}\nRole    : ${credentialCard.role}\nUsername: ${credentialCard.username}\nPassword: ${credentialCard.password}\n${'─'.repeat(30)}\n* Please change your password after first login.`;
                   navigator.clipboard?.writeText(text);
-                  showToast('Kredensial lengkap disalin ke clipboard!', 'success');
+                  showToast('Full credentials copied to clipboard!', 'success');
                 }}
                 className="flex-1 flex items-center justify-center gap-2 bg-[#00D4FF]/10 hover:bg-[#00D4FF]/20 border border-[#00D4FF]/30 text-[#00D4FF] rounded-xl px-4 py-3 text-sm font-semibold transition-colors"
               >
-                <Copy size={16} /> Salin Semua
+                <Copy size={16} /> Copy All
               </button>
               <button
                 onClick={() => {
                   const w = window.open('', '_blank');
-                  w.document.write(`<!DOCTYPE html><html><head><title>Kredensial Login - ${credentialCard.name}</title><style>
+                  w.document.write(`<!DOCTYPE html><html><head><title>Login Credentials - ${credentialCard.name}</title><style>
                     body{font-family:Arial,sans-serif;background:#fff;color:#111;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
                     .card{border:2px solid #00D4FF;border-radius:16px;padding:32px 40px;max-width:400px;width:100%;box-shadow:0 4px 24px rgba(0,212,255,0.15)}
                     h2{color:#00D4FF;margin:0 0 4px;font-size:18px}
@@ -7402,8 +7776,8 @@ function SettingsModule({ db, setDb, generateId, user, showToast, requestConfirm
                     <h2>🔐 Login Credentials</h2>
                     <p class="sub">${credentialCard.name} &bull; ${credentialCard.role}</p>
                     <div class="field"><div class="label">Username</div><div class="value">${credentialCard.username}</div></div>
-                    <div class="field"><div class="label">Password Sementara</div><div class="value">${credentialCard.password}</div></div>
-                    <div class="note">⚠️ Ganti password setelah login pertama kali demi keamanan akun Anda.</div>
+                    <div class="field"><div class="label">Temporary Password</div><div class="value">${credentialCard.password}</div></div>
+                    <div class="note">⚠️ Please change your password after your first login for account security.</div>
                     <hr class="divider"/>
                     <div class="logo">ECG Academic Suite</div>
                   </div>
@@ -7413,13 +7787,13 @@ function SettingsModule({ db, setDb, generateId, user, showToast, requestConfirm
                 }}
                 className="flex-1 flex items-center justify-center gap-2 bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/30 text-purple-300 rounded-xl px-4 py-3 text-sm font-semibold transition-colors"
               >
-                <Printer size={16} /> Print / Simpan PDF
+                <Printer size={16} /> Print / Save PDF
               </button>
               <button
                 onClick={() => setCredentialCard(null)}
                 className="sm:w-auto flex items-center justify-center gap-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 rounded-xl px-4 py-3 text-sm font-semibold transition-colors"
               >
-                <Check size={16} /> Selesai
+                <Check size={16} /> Done
               </button>
             </div>
           </div>
@@ -7429,7 +7803,7 @@ function SettingsModule({ db, setDb, generateId, user, showToast, requestConfirm
       <CustomModal isOpen={!!resetDialog} onClose={() => {setResetDialog(null); setNewPassword('');}} title="Reset Password">
         <p className="text-gray-400 mb-6 text-sm">You are manually resetting the password for <b>{resetDialog?.name}</b>.</p>
         <form onSubmit={handleResetPassword} className="space-y-4">
-           <Input label="New Password" type="text" value={newPassword} onChange={setNewPassword} required placeholder="Enter new password" />
+           <Input label="New Password" type="password" value={newPassword} onChange={setNewPassword} required placeholder="Enter new password" />
            <div className="flex justify-end gap-3 pt-2">
              <Button variant="ghost" onClick={() => {setResetDialog(null); setNewPassword('');}}>Cancel</Button>
              <Button type="submit" className="bg-red-500 hover:bg-red-600 text-white border-none shadow-none">Force Reset</Button>
@@ -8053,7 +8427,8 @@ function StudentReadOnlyPaymentModule({ db, user, downloadPNG, handleShareImage,
               <span className="text-2xl sm:text-3xl font-mono font-black text-[#00D4FF] tracking-wider drop-shadow-md">0951837774</span>
               <button
                   onClick={() => {
-                      navigator.clipboard.writeText('0951837774');
+                      // BUGFIX: Tambahkan optional chaining agar tidak crash di browser yang tidak support clipboard API
+                      navigator.clipboard?.writeText('0951837774');
                       showToast(language === 'id' ? 'Nomor rekening BNI disalin!' : 'BNI Account number copied!');
                   }}
                   className="bg-[#00D4FF]/10 hover:bg-[#00D4FF]/20 text-[#00D4FF] p-2.5 rounded-lg transition-all active:scale-95 shadow-sm border border-[#00D4FF]/20"
@@ -8133,7 +8508,14 @@ function StudentReadOnlyReportModule({ db, user, downloadPNG, handleShareImage, 
   const assessments = db.assessments.filter((a) => a.studentId === student.id && Number(a.month) === reportMonth && Number(a.year) === reportYear);
   const avgScore = assessments.length ? Math.round(assessments.reduce((sum, a) => sum + a.average, 0) / assessments.length) : 0;
   
-  const journals = db.journals.filter((j) => j.sessionGroup === getStudentSession(student) && j.date.startsWith(reportPrefix));
+  // BUGFIX: Gunakan fuzzy match agar jurnal tidak kosong di report card karena perbedaan format nama sesi
+  const _reportStudentSession = getStudentSession(student);
+  const journals = db.journals.filter((j) => {
+    if (!j.date.startsWith(reportPrefix)) return false;
+    const jg = (j.sessionGroup || '').toLowerCase();
+    const sg = (_reportStudentSession || '').toLowerCase();
+    return jg === sg || jg.includes(sg) || sg.includes(jg);
+  });
 
   const studentSession = getStudentSession(student);
   const reportSubjects = studentSession === SESSIONS[0]
@@ -8331,16 +8713,18 @@ function StudentReadOnlyReportModule({ db, user, downloadPNG, handleShareImage, 
           <div className="mb-6 break-inside-avoid">
             <p className="text-[11px] font-bold text-slate-400 uppercase tracking-[0.8px] mb-1.5">Session Detail & Attendance Log</p>
             {(() => {
-              const uniqueDates = Array.from(new Set([...att.map(a => a.date), ...journals.map(j => j.date)]))
-                .sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
-              
-              const combinedSessions = uniqueDates.map(date => {
-                  const journalEntry = journals.find(j => j.date === date);
-                  const attEntry = att.find(a => a.date === date);
+              // FIX: Anchor ke attendance siswa saja (bukan union dengan journal).
+              const sortedAtt = [...att].sort((a, b) =>
+                new Date(a.date).getTime() - new Date(b.date).getTime()
+              );
+
+              const combinedSessions = sortedAtt.map(attEntry => {
+                  const journalEntry = journals.find(j => j.date === attEntry.date && j.scheduleId === attEntry.scheduleId)
+                    || journals.find(j => j.date === attEntry.date);
                   return {
-                      date: date,
+                      date: attEntry.date,
                       topic: journalEntry?.topic || "No lesson record entered",
-                      status: attEntry?.status || "—",
+                      status: attEntry.status || "—",
                       note: (journalEntry?.notes && journalEntry.notes.trim() !== "") ? journalEntry.notes : "Auto-generated from system"
                   };
               });
@@ -8838,12 +9222,15 @@ function StudentSpeakingChallengeModule({ db, setDb, user, showToast, language =
   ], []);
 
   // 1. Hitung Siklus Hari berdasarkan Total Data di Bank Kalimat
+  // FIX #4 (TIMEZONE): Hitung dayOfYear dari komponen tanggal LOKAL (bukan epoch ms)
+  // agar konsisten dengan getTodayDateLocal() dan tidak ada shift ±1 hari di zona non-UTC.
   const maxDays = SENTENCE_BANK.length; // Otomatis menyesuaikan (sekarang 365+)
   const todayDate = new Date();
+  // Gunakan new Date(y, m-1, d) — lokal — bukan epoch arithmetic berbasis UTC
   const startOfYear = new Date(todayDate.getFullYear(), 0, 1);
-  const diff = (todayDate.getTime() - startOfYear.getTime()) + ((startOfYear.getTimezoneOffset() - todayDate.getTimezoneOffset()) * 60 * 1000);
+  const todayLocal = new Date(todayDate.getFullYear(), todayDate.getMonth(), todayDate.getDate());
   const oneDay = 1000 * 60 * 60 * 24;
-  const dayOfYear = Math.floor(diff / oneDay);
+  const dayOfYear = Math.floor((todayLocal.getTime() - startOfYear.getTime()) / oneDay);
   const currentCycleDay = dayOfYear % maxDays; // Siklus dinamis (Setahun Penuh)
 
   // 2. Deteksi Role dan Level
@@ -8892,6 +9279,15 @@ function StudentSpeakingChallengeModule({ db, setDb, user, showToast, language =
         const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
         if (isIOS || isSafari) setIsSafariOrIOS(true);
      }
+
+     // FIX #14 (AUDIOCONTEXT LEAK): Tutup AudioContext saat komponen unmount
+     // agar tidak terjadi resource leak jika komponen di-mount/unmount berkali-kali.
+     return () => {
+       if (audioCtx && audioCtx.state !== 'closed') {
+         audioCtx.close().catch(() => {});
+         audioCtx = null;
+       }
+     };
   }, []);
 
   const startSpeakingChallenge = () => {
@@ -8951,7 +9347,8 @@ function StudentSpeakingChallengeModule({ db, setDb, user, showToast, language =
                        return { 
                           ...s, 
                           lastSpeakingChallengeDate: todayStr,
-                          speakingChallengeCompletedCount: (s.speakingChallengeCompletedCount || 0) + 1
+                          speakingChallengeCompletedCount: (s.speakingChallengeCompletedCount || 0) + 1,
+                          updatedAt: getLocalTimestamp(), // BUGFIX (BUG 6): LWW wajib tahu versi ini lebih baru
                        };
                     }
                     return s;
@@ -9406,7 +9803,7 @@ function DataExportModule({ db }) {
 
       ws.mergeCells(7, 1, 7, lastCol);
       const metaCell = ws.getCell(7, 1);
-      metaCell.value = `Tanggal Cetak: ${today}   |   Dicetak: ${printedAt}   |   Dibuat Oleh: Sistem ECG Smart Portal`;
+      metaCell.value = `Print Date: ${today}   |   Printed At: ${printedAt}   |   Generated By: ECG Smart Portal System`;
       metaCell.font = { size: 9, italic: true, color: { argb: 'FF6B7280' } };
       ws.getRow(7).height = 14;
 
@@ -9489,13 +9886,13 @@ function DataExportModule({ db }) {
       r,
       ['Metric', 'Value'],
       [
-        ['Total Siswa Terdaftar', totalStudentsCount],
-        ['Total Siswa Aktif', activeStudentsCount],
-        ['Total Tutor Aktif', activeTutorsCount],
-        ['Rata-rata Kehadiran Siswa (Semua Waktu)', `${attendanceRateAll}%`],
-        ['Rata-rata Nilai Akademik (Semua Waktu)', avgScoreAll],
-        ['Pendapatan Bulan Berjalan', `Rp ${monthlyRevenue.toLocaleString('id-ID')}`],
-        ['Total Pendapatan (Semua Waktu, Lunas)', `Rp ${totalRevenueAllTime.toLocaleString('id-ID')}`],
+        ['Total Registered Students', totalStudentsCount],
+        ['Total Active Students', activeStudentsCount],
+        ['Total Active Tutors', activeTutorsCount],
+        ['Avg Student Attendance (All Time)', `${attendanceRateAll}%`],
+        ['Avg Academic Score (All Time)', avgScoreAll],
+        ['Current Month Revenue', `Rp ${monthlyRevenue.toLocaleString('id-ID')}`],
+        ['Total Revenue (All Time, Paid)', `Rp ${totalRevenueAllTime.toLocaleString('id-ID')}`],
       ],
       { currencyCols: [] }
     );
@@ -9506,7 +9903,7 @@ function DataExportModule({ db }) {
     addTable(
       wsStudents,
       r2,
-      ['ID', 'Nama', 'Level', 'Kelas', 'Sesi', 'No. WhatsApp', 'Payment Plan', 'Status'],
+      ['ID', 'Name', 'Level', 'Class', 'Session', 'WhatsApp No.', 'Payment Plan', 'Status'],
       db.students.map((s) => [
         s.id,
         s.name,
@@ -9526,7 +9923,7 @@ function DataExportModule({ db }) {
     addTable(
       wsTutors,
       r3,
-      ['ID', 'Nama', 'Spesialisasi / Sesi Mengajar', 'No. Telp / WA', 'Status', 'Total Sesi Hadir'],
+      ['ID', 'Name', 'Specialization / Teaching Session', 'Phone / WA No.', 'Status', 'Total Sessions Attended'],
       db.tutors.map((t) => {
         const totalSessions = db.tutorAttendance.filter((a) => a.tutorId === t.id && a.status === 'Present').length;
         return [t.id, t.name, parseSessions(t.teachingSession).join(', ') || '', t.phone || '', t.status || '', totalSessions];
@@ -9547,7 +9944,7 @@ function DataExportModule({ db }) {
     addTable(
       wsAttendance,
       r4,
-      ['ID', 'Nama Siswa', 'Kelas', 'Total Sesi Tercatat', 'Total Hadir', 'Persentase Kehadiran'],
+      ['ID', 'Student Name', 'Class', 'Total Recorded Sessions', 'Total Present', 'Attendance Rate'],
       attendanceByStudent,
       { centerCols: [3, 4, 5] }
     );
@@ -9569,7 +9966,7 @@ function DataExportModule({ db }) {
     addTable(
       wsAcademic,
       r5,
-      ['ID Siswa', 'Nama Siswa', 'Kelas', 'Bulan/Tahun', 'Rata-rata Nilai', 'Kategori'],
+      ['Student ID', 'Student Name', 'Class', 'Month/Year', 'Average Score', 'Category'],
       academicRows,
       { centerCols: [3, 4, 5] }
     );
@@ -9587,14 +9984,14 @@ function DataExportModule({ db }) {
     const lastDataRow = addTable(
       wsPayments,
       r6,
-      ['ID Transaksi', 'Tanggal', 'Nama Siswa', 'Bulan/Tahun', 'Kelas', 'Metode', 'Jumlah (Rp)'],
+      ['Transaction ID', 'Date', 'Student Name', 'Month/Year', 'Class', 'Method', 'Amount (Rp)'],
       sortedPayments.map((p) => [p.id, p.date, p.studentName, `${p.month}/${p.year}`, p.class, p.method || '', Number(p.amount)]),
       { centerCols: [1, 3, 4, 5], currencyCols: [6] }
     );
     const totalRow = wsPayments.getRow(lastDataRow + 1);
     wsPayments.mergeCells(lastDataRow + 1, 1, lastDataRow + 1, 6);
     const totalLabelCell = totalRow.getCell(1);
-    totalLabelCell.value = 'TOTAL PENDAPATAN (LUNAS)';
+    totalLabelCell.value = 'TOTAL REVENUE (PAID)';
     totalLabelCell.font = { bold: true, size: 10 };
     totalLabelCell.alignment = { horizontal: 'right' };
     totalLabelCell.border = ALL_BORDERS;
@@ -9622,7 +10019,7 @@ function DataExportModule({ db }) {
     <div className="space-y-6">
       <div>
         <h2 className="text-2xl font-bold text-white mb-1">Data Export</h2>
-        <p className="text-gray-400 text-sm">Unduh seluruh data aplikasi dalam format laporan korporat (.xlsx).</p>
+        <p className="text-gray-400 text-sm">Download all application data in corporate report format (.xlsx).</p>
       </div>
       <Card className="flex flex-col items-center justify-center text-center py-16">
         <div className="w-16 h-16 rounded-full bg-[#00D4FF]/10 border border-[#00D4FF]/30 flex items-center justify-center mb-5">
@@ -9630,7 +10027,7 @@ function DataExportModule({ db }) {
         </div>
         <h3 className="text-lg font-semibold text-white mb-1">Corporate Data Export</h3>
         <p className="text-gray-400 text-sm mb-6 max-w-md">
-          Export lengkap dengan kop surat (logo, alamat, WhatsApp) mencakup Executive Summary, Students Directory, Tutors Directory, Attendance Summary, Academic Performance, dan Financial Report dalam satu file Excel.
+          Full export with letterhead (logo, address, WhatsApp) covering Executive Summary, Students Directory, Tutors Directory, Attendance Summary, Academic Performance, and Financial Report in a single Excel file.
         </p>
         <button
           onClick={exportToExcel}
@@ -10017,7 +10414,8 @@ function MaterialsModule({ db, setDb, generateId, showToast, softDelete, user })
     if (isEditingId) {
        setDb(p => ({
           ...p,
-          materials: p.materials.map(m => m.id === isEditingId ? { ...m, ...formData } : m)
+          // BUGFIX: Tambahkan updatedAt agar LWW tidak kalah ke cloud lama saat edit material
+          materials: p.materials.map(m => m.id === isEditingId ? { ...m, ...formData, updatedAt: getLocalTimestamp() } : m)
        }));
        showToast('Material updated successfully');
     } else {
@@ -10027,7 +10425,8 @@ function MaterialsModule({ db, setDb, generateId, showToast, softDelete, user })
          tutorId: user.id,
          tutorName: user.name,
          date: getTodayDateLocal(),
-         submissions: []
+         submissions: [],
+         updatedAt: getLocalTimestamp(), // FIX BUG 3: timestamp untuk LWW
        };
        setDb(p => ({ ...p, materials: [...(p.materials || []), newMat] }));
        showToast('Material posted successfully');
@@ -10055,6 +10454,8 @@ function MaterialsModule({ db, setDb, generateId, showToast, softDelete, user })
         newMats[matIdx].submissions = [...(newMats[matIdx].submissions || [])]; // deep copy submissions
         newMats[matIdx].submissions[subIdx] = { ...newMats[matIdx].submissions[subIdx] }; // deep copy submission
         newMats[matIdx].submissions[subIdx].checked = !newMats[matIdx].submissions[subIdx].checked;
+        // BUGFIX (BUG 8): Update updatedAt di parent material agar LWW tahu versi ini lebih baru dari cloud
+        newMats[matIdx].updatedAt = getLocalTimestamp();
       }
       return { ...p, materials: newMats };
     });
@@ -10078,6 +10479,7 @@ function MaterialsModule({ db, setDb, generateId, showToast, softDelete, user })
                date: (() => { const _n = new Date(); return `${String(_n.getDate()).padStart(2,'0')}/${String(_n.getMonth()+1).padStart(2,'0')}/${_n.getFullYear()}, ${String(_n.getHours()).padStart(2,'0')}:${String(_n.getMinutes()).padStart(2,'0')}`; })()
            }];
            newMats[matIdx].submissions[subIdx].checked = true; // Auto-check saat tutor mereply
+           newMats[matIdx].updatedAt = getLocalTimestamp(); // BUGFIX (BUG 8): LWW parent material
         }
         return { ...p, materials: newMats };
      });
@@ -10356,6 +10758,9 @@ function StudentMaterialsModule({ db, setDb, user, showToast, language = 'en' })
   const handleSubmitComment = (matId, existingSubIdx = -1) => {
     const text = comment[matId]?.trim();
     if (!text) return showToast('Please write your comment or submission first', 'warning');
+    // FIX #5: Guard jika data siswa belum dimuat dari cloud — jangan simpan submission
+    // dengan studentId undefined karena akan menyebabkan duplikasi submission tak terbatas.
+    if (!student?.id) return showToast(language === 'id' ? 'Data siswa belum dimuat, coba lagi.' : 'Student data not loaded yet, please try again.', 'warning');
     
     setDb(p => {
       const newMats = [...(p.materials || [])];
@@ -10385,6 +10790,8 @@ function StudentMaterialsModule({ db, setDb, user, showToast, language = 'en' })
              replies: []
            });
         }
+        // BUGFIX (BUG 8): Update updatedAt parent material agar LWW tahu ada submission/reply baru
+        newMats[matIdx].updatedAt = getLocalTimestamp();
       }
       return { ...p, materials: newMats };
     });
